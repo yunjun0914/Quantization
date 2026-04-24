@@ -1,4 +1,5 @@
 #!/bin/bash
+#SBATCH --account=rabbit
 #SBATCH --job-name=omniquant_w4a16
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
