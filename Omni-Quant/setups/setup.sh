@@ -1,5 +1,13 @@
 #!/bin/bash
 
+# GPU 할당
+srun --gres=gpu:1 --mem=32G --pty bash << 'EOF'
+
+# CUDA 환경변수 설정
+export CUDA_HOME=/usr/local/cuda
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+
 # venv 활성화
 source ~/yunjun_env/bin/activate
 
@@ -27,7 +35,8 @@ git clone https://huggingface.co/ChenMnZ/act_scales
 # OPT-125m 다운로드
 python -c "
 from huggingface_hub import snapshot_download
-snapshot_download(repo_id='facebook/opt-125m', local_dir='~/Quantization/Omni-Quant/OmniQuant/models/opt-125m')
+snapshot_download(repo_id='facebook/opt-125m', local_dir='./models/opt-125m')
 "
 
 echo "Setup done!"
+EOF
