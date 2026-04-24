@@ -22,4 +22,4 @@ python main.py \
     --abits 16 \
     --act-scales ./act_scales/opt-125m.pt \
     --act-shifts ./act_shifts/opt-125m.pt \
-    --save-dir ./output/omniquant_w4a16
+    --save_dir ./output/omniquant_w4a16
