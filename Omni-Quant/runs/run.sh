@@ -20,6 +20,8 @@ python main.py \
     --model ./models/opt-125m \
     --wbits 4 \
     --abits 16 \
+    --lwc \
+    --let \
     --act-scales ./act_scales/opt-125m.pt \
     --act-shifts ./act_shifts/opt-125m.pt \
     --save_dir ./output/omniquant_w4a16
