@@ -1,20 +1,25 @@
 #!/bin/bash
 
-source /path/to/yunjun_env/bin/activate
+# venv 활성화
+source ~/yunjun_env/bin/activate
 
-cd Quantization
+# PyTorch 먼저 설치 (CUDA 12.1 기준)
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
-# AutoGPTQ 먼저 설치
-cd AutoGPTQ-bugfix && pip install -v . && cd ..
+# AutoGPTQ 설치
+cd ~/Omni-Quant/AutoGPTQ-bugfix && pip install -v . && cd ~/Omni-Quant
 
 # OmniQuant 설치
-cd OmniQuant && pip install -e . && cd ..
+cd ~/Omni-Quant/OmniQuant && pip install -e . && cd ~/Omni-Quant
 
 # requirements 설치
-pip install -r requirements_linux.txt
+pip install -r ~/Omni-Quant/requirements_linux.txt
+
+# huggingface_hub 설치
+pip install huggingface_hub
 
 # calibration 데이터 다운로드
-cd OmniQuant
+cd ~/Omni-Quant/OmniQuant
 git lfs install
 git clone https://huggingface.co/ChenMnZ/act_shifts
 git clone https://huggingface.co/ChenMnZ/act_scales
