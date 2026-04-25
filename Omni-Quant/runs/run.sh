@@ -19,6 +19,9 @@ cd ~/Quantization/Omni-Quant/OmniQuant
 
 python main.py \
     --model ./models/opt-125m \
+    --epochs 20 \
+    --output_dir ./log/opt-125m-w4a16 \
+    --eval_ppl \
     --wbits 4 \
     --abits 16 \
     --lwc \
