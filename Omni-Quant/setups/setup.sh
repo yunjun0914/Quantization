@@ -38,5 +38,21 @@ from huggingface_hub import snapshot_download
 snapshot_download(repo_id='facebook/opt-125m', local_dir='./models/opt-125m')
 "
 
+# LLaMA-1 7B 다운로드 (공개 변환본)
+python -c "
+from huggingface_hub import snapshot_download
+snapshot_download(repo_id='huggyllama/llama-7b', local_dir='./models/llama-7b')
+"
+
+# LLaMA-2 7B 다운로드 (Meta 라이선스 동의 + HF 토큰 필요)
+# 사전 준비: huggingface-cli login 또는 HF_TOKEN 환경변수 설정
+# https://huggingface.co/meta-llama/Llama-2-7b-hf 에서 라이선스 동의 필요
+python -c "
+import os
+from huggingface_hub import snapshot_download
+token = os.environ.get('HF_TOKEN')
+snapshot_download(repo_id='meta-llama/Llama-2-7b-hf', local_dir='./models/llama2-7b', token=token)
+"
+
 echo "Setup done!"
 EOF
