@@ -1,0 +1,31 @@
+#!/bin/bash
+#SBATCH --account=rabbit
+#SBATCH --job-name=omniquant_w2a16
+#SBATCH --nodes=1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=32G
+#SBATCH --time=12:00:00
+#SBATCH --output=/home/yunjun0914/Quantization/Omni-Quant/logs/%x_%j.out
+#SBATCH --error=/home/yunjun0914/Quantization/Omni-Quant/logs/%x_%j.err
+
+source ~/yunjun_env/bin/activate
+
+export CUDA_HOME=/usr/local/cuda
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+
+cd ~/Quantization/Omni-Quant/OmniQuant
+
+python main.py \
+    --model ./models/opt-125m \
+    --net opt-125m \
+    --epochs 20 \
+    --output_dir ./log/opt-125m-w2a16 \
+    --eval_ppl \
+    --wbits 2 \
+    --abits 16 \
+    --lwc \
+    --act-scales ./act_scales/opt-125m.pt \
+    --act-shifts ./act_shifts/opt-125m.pt \
+    --save_dir ./output/omniquant_w2a16
