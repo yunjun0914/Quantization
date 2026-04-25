@@ -19,7 +19,7 @@ cd ~/Quantization/Omni-Quant/OmniQuant
 
 python main.py \
     --model ./models/llama2-7b \
-    --net llama-2-7b \
+    --net Llama-2-7b \
     --epochs 20 \
     --output_dir ./log/llama2-7b-w4a16 \
     --eval_ppl \
