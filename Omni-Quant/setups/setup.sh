@@ -6,41 +6,41 @@ set -e
 
 export CUDA_HOME=/usr/local/cuda
 export PATH=$CUDA_HOME/bin:$PATH
-export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+unset LD_LIBRARY_PATH
 
 source ~/yunjun_omni/bin/activate
 
-python -m pip install --upgrade pip setuptools wheel packaging ninja
+python3 -m pip install --upgrade pip wheel packaging ninja
+python3 -m pip install "setuptools==70.2.0"
 
-# PyTorch 설치
-python -m pip install --no-cache-dir \
-    torch==2.5.1+cu121 \
-    torchvision==0.20.1+cu121 \
-    torchaudio==2.5.1+cu121 \
-    --index-url https://download.pytorch.org/whl/cu121
+# PyTorch 설치: CUDA 13.0
+python3 -m pip install --no-cache-dir torch torchvision torchaudio \
+    --index-url https://download.pytorch.org/whl/cu130
 
 # PyTorch import 확인
-python - << 'PY'
+python3 - << 'PY'
 import torch
 print("torch:", torch.__version__)
 print("cuda available:", torch.cuda.is_available())
 print("cuda version:", torch.version.cuda)
+print("device count:", torch.cuda.device_count())
+if torch.cuda.is_available():
+    print("device:", torch.cuda.get_device_name(0))
 PY
+
+# requirements 설치
+python3 -m pip install -r ~/Quantization/Omni-Quant/requirements_linux.txt
 
 # AutoGPTQ 설치
 cd ~/Quantization/Omni-Quant/AutoGPTQ-bugfix
-
-python -m pip install -v . --no-build-isolation
+python3 -m pip install -v . --no-build-isolation
 
 # OmniQuant 설치
 cd ~/Quantization/Omni-Quant/OmniQuant
-python -m pip install -e .
-
-# requirements 설치
-python -m pip install -r ~/Quantization/Omni-Quant/requirements_linux.txt
+python3 -m pip install -e .
 
 # Hugging Face 관련 설치
-python -m pip install -U huggingface_hub
+python3 -m pip install "huggingface_hub==0.36.0"
 
 # calibration 데이터 다운로드
 cd ~/Quantization/Omni-Quant/OmniQuant
@@ -56,7 +56,7 @@ if [ ! -d "act_scales" ]; then
 fi
 
 # 모델 다운로드
-python - << 'PY'
+python3 - << 'PY'
 from huggingface_hub import snapshot_download
 
 models = {
