@@ -18,7 +18,7 @@ export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$CUDA_HOME/lib64:$LD_LIBRARY_PA
 cd ~/Quantization/Omni-Quant/OmniQuant
 
 python main.py \
-    --model ./models/llama2-7b \
+    --model ~/Quantization/Omni-Quant/OmniQuant/models/llama2-7b
     --net Llama-2-7b \
     --epochs 20 \
     --output_dir ./log/llama2-7b-w4a16 \
