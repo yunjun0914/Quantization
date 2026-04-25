@@ -19,13 +19,13 @@ cd ~/Quantization/Omni-Quant/OmniQuant
 
 python main.py \
     --model ./models/llama2-7b \
-    --net llama2-7b \
+    --net llama-2-7b \
     --epochs 20 \
     --output_dir ./log/llama2-7b-w3a16 \
     --eval_ppl \
     --wbits 3 \
     --abits 16 \
     --lwc \
-    --act-scales ./act_scales/llama2-7b.pt \
-    --act-shifts ./act_shifts/llama2-7b.pt \
+    --act-scales ./act_scales/llama-2-7b.pt \
+    --act-shifts ./act_shifts/llama-2-7b.pt \
     --save_dir ./output/llama2_7b_w3a16
