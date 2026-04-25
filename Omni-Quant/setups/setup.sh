@@ -1,35 +1,48 @@
+cat > ~/Quantization/Omni-Quant/setups/setup.sh << 'EOF'
 #!/bin/bash
 
-srun --gres=gpu:1 --mem=32G bash << 'EOF'
+srun --gres=gpu:1 --mem=32G bash << 'INNER_EOF'
 
 set -e
+
+source ~/yunjun_omni/bin/activate
 
 export CUDA_HOME=/usr/local/cuda
 export PATH=$CUDA_HOME/bin:$PATH
 unset LD_LIBRARY_PATH
 
-source ~/yunjun_omni/bin/activate
+cd ~/Quantization/Omni-Quant
 
-python3 -m pip install --upgrade pip wheel packaging ninja
-python3 -m pip install "setuptools==70.2.0"
+python3 -m pip install -U pip
+python3 -m pip install "setuptools==70.2.0" "wheel==0.47.0" "packaging==26.2" "ninja==1.13.0"
 
-# PyTorch 설치: CUDA 13.0
+# PyTorch: nvcc가 12.9로 잡히므로 cu129 사용
+python3 -m pip uninstall -y torch torchvision torchaudio triton || true
 python3 -m pip install --no-cache-dir torch torchvision torchaudio \
-    --index-url https://download.pytorch.org/whl/cu130
+  --index-url https://download.pytorch.org/whl/cu129
 
-# PyTorch import 확인
+# requirements + AutoGPTQ build dependency
+python3 -m pip install -r ~/Quantization/Omni-Quant/requirements_linux.txt
+python3 -m pip install gekko
+
+# CUDA / Torch 확인
 python3 - << 'PY'
+import subprocess
 import torch
+
 print("torch:", torch.__version__)
+print("torch cuda:", torch.version.cuda)
 print("cuda available:", torch.cuda.is_available())
-print("cuda version:", torch.version.cuda)
 print("device count:", torch.cuda.device_count())
 if torch.cuda.is_available():
     print("device:", torch.cuda.get_device_name(0))
-PY
 
-# requirements 설치
-python3 -m pip install -r ~/Quantization/Omni-Quant/requirements_linux.txt
+try:
+    out = subprocess.check_output(["nvcc", "--version"], text=True)
+    print(out)
+except Exception as e:
+    print("nvcc check failed:", e)
+PY
 
 # AutoGPTQ 설치
 cd ~/Quantization/Omni-Quant/AutoGPTQ-bugfix
@@ -39,7 +52,7 @@ python3 -m pip install -v . --no-build-isolation
 cd ~/Quantization/Omni-Quant/OmniQuant
 python3 -m pip install -e .
 
-# Hugging Face 관련 설치
+# Hugging Face
 python3 -m pip install "huggingface_hub==0.36.0"
 
 # calibration 데이터 다운로드
@@ -64,7 +77,6 @@ models = {
     "opt-1.3b": "facebook/opt-1.3b",
     "opt-2.7b": "facebook/opt-2.7b",
     "opt-6.7b": "facebook/opt-6.7b",
-
     "llama1-7b": "huggyllama/llama-7b",
     "llama2-7b": "meta-llama/Llama-2-7b-hf",
 }
@@ -83,4 +95,8 @@ PY
 
 echo "Setup done!"
 
+INNER_EOF
 EOF
+
+chmod +x ~/Quantization/Omni-Quant/setups/setup.sh
+bash ~/Quantization/Omni-Quant/setups/setup.sh
