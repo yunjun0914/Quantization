@@ -19,13 +19,13 @@ cd ~/Quantization/Omni-Quant/OmniQuant
 
 python main.py \
     --model ./models/opt-125m \
+    --net opt-125m \
     --epochs 20 \
     --output_dir ./log/opt-125m-w4a16 \
     --eval_ppl \
     --wbits 4 \
     --abits 16 \
     --lwc \
-    --let \
     --act-scales ./act_scales/opt-125m.pt \
     --act-shifts ./act_shifts/opt-125m.pt \
     --save_dir ./output/omniquant_w4a16
