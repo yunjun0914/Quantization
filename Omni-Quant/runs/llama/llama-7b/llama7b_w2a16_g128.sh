@@ -1,6 +1,6 @@
 #!/bin/bash
 #SBATCH --account=rabbit
-#SBATCH --job-name=llama2_7b_w2a16
+#SBATCH --job-name=llama7b_w2a16
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
@@ -18,15 +18,15 @@ export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$CUDA_HOME/lib64:$LD_LIBRARY_PA
 cd ~/Quantization/Omni-Quant/OmniQuant
 
 python main.py \
-    --model ~/Quantization/Omni-Quant/OmniQuant/models/llama2-7b \
-    --net Llama-2-7b \
+    --model ./models/llama-7b \
+    --net llama-7b \
     --epochs 20 \
-    --output_dir ./log/llama2-7b-w2a16 \
+    --output_dir ./log/llama-7b-w2a16 \
     --eval_ppl \
     --wbits 2 \
     --abits 16 \
     --group_size 128 \
     --lwc \
-    --act-scales ./act_scales/llama-2-7b.pt \
-    --act-shifts ./act_shifts/llama-2-7b.pt \
-    --save_dir ./output/llama2_7b_w2a16
+    --act-scales ./act_scales/llama-7b.pt \
+    --act-shifts ./act_shifts/llama-7b.pt \
+    --save_dir ./output/llama7b_w2a16
