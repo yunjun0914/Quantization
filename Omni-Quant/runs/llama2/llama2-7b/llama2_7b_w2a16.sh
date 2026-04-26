@@ -3,7 +3,7 @@
 #SBATCH --job-name=llama2_7b_w2a16
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=16
 #SBATCH --mem=32G
 #SBATCH --time=12:00:00
 #SBATCH --output=/home/yunjun0914/Quantization/Omni-Quant/logs/%x_%j.out
@@ -18,7 +18,7 @@ export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$CUDA_HOME/lib64:$LD_LIBRARY_PA
 cd ~/Quantization/Omni-Quant/OmniQuant
 
 python main.py \
-    --model ./models/llama2-7b \
+    --model ~/Quantization/Omni-Quant/OmniQuant/models/llama2-7b \
     --net Llama-2-7b \
     --epochs 20 \
     --output_dir ./log/llama2-7b-w2a16 \

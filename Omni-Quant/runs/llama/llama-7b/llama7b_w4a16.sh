@@ -3,7 +3,7 @@
 #SBATCH --job-name=llama7b_w4a16
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=4
+#SBATCH --cpus-per-task=16
 #SBATCH --mem=32G
 #SBATCH --time=12:00:00
 #SBATCH --output=/home/yunjun0914/Quantization/Omni-Quant/logs/%x_%j.out
