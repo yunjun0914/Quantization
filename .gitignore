@@ -1,0 +1,23 @@
+# Python virtual environments
+venv/
+.venv/
+Practice/.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Hugging Face / model cache
+.cache/
+outputs/
+checkpoints/
+
+# Large model files
+*.pt
+*.pth
+*.safetensors
+*.bin
