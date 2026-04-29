@@ -20,7 +20,7 @@ cd ~/Quantization/Omni-Quant/OmniQuant
 python main.py \
     --model ./models/llama-13b \
     --net llama-13b \
-    --epochs 20 \
+    --epochs 40 \
     --output_dir ./log/llama-13b-w2a16 \
     --eval_ppl \
     --wbits 2 \
