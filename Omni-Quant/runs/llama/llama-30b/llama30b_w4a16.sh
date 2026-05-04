@@ -4,7 +4,7 @@
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=64G
+#SBATCH --mem=60G
 #SBATCH --time=12:00:00
 #SBATCH --output=/home/yunjun0914/Quantization/Omni-Quant/logs/%x_%j.out
 #SBATCH --error=/home/yunjun0914/Quantization/Omni-Quant/logs/%x_%j.err
