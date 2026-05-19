@@ -14,19 +14,18 @@ MODEL_NAME    = "facebook/opt-1.3b"
 NSAMPLES      = 128
 CALIB_SEQ_LEN = 2048
 SEED          = 0
-NMF_STEPS     = 500
+NMF_STEPS     = 2000
 ALPHAS        = [0.5]   # sweet spot 고정
 
 # (r_nmf, r_corr, corr_int4, nmf_int4)
+# 1.3B: dim=2048라 125m(768) 대비 rank 2~3배 필요
+# r_nmf/dim 비율을 125m과 비슷하게 맞춤
 CONFIGS = [
-    # mean alpha (r_nmf=0): NMF bits를 correction에 전환
-    ( 0, 128, True, False),
-    ( 0, 144, True, False),
-    ( 0, 160, True, False),
-    ( 0, 176, True, False),
-    # NMF 비교
-    ( 8, 128, True, False),
-    (16, 128, True, False),
+    (32, 256, True, False),   # bpw_attn≈1.50
+    (32, 384, True, False),   # bpw_attn≈1.75
+    (64, 256, True, False),   # bpw_attn≈1.75
+    (64, 384, True, False),   # bpw_attn≈2.00
+    (64, 512, True, False),   # bpw_attn≈2.25
 ]
 
 

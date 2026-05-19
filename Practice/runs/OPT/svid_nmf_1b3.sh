@@ -19,4 +19,4 @@ mkdir -p ~/Quantization/Practice/logs
 
 cd ~/Quantization/Practice/OPT
 
-python svid_nmf_1b3.py
+python -u svid_nmf_1b3.py
