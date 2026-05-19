@@ -2,6 +2,9 @@ import torch
 import torch.nn as nn
 import math
 import random
+import time
+import sys
+from tqdm import tqdm
 
 
 # ============================================================
@@ -360,8 +363,10 @@ if __name__ == "__main__":
     for alpha in ALPHAS:
         for r_nmf, r_corr, corr_int4, nmf_int4 in CONFIGS:
             rel_errs, bpws = [], []
+            t0 = time.time()
 
-            for name in W_dict:
+            desc = f"a={alpha:.2f} nmf={r_nmf} corr={r_corr}"
+            for name in tqdm(list(W_dict.keys()), desc=desc, ncols=110, file=sys.stdout):
                 H = H_dict[name].to(device)
                 W = W_dict[name].to(device)
 
@@ -383,12 +388,14 @@ if __name__ == "__main__":
             ppl = compute_perplexity(model, test_ids, device)
             restore_weights(model, W_dict)
 
+            elapsed = time.time() - t0
             mean_err = sum(rel_errs) / len(rel_errs)
             mean_bpw = sum(bpws) / len(bpws)
 
             q_str = ('i4/i4' if nmf_int4 else 'i4') if corr_int4 else 'fp16'
             print(f"{alpha:>6.2f} {r_nmf:>6} {r_corr:>7} {q_str:>6} {mean_bpw:>8.4f} "
-                  f"{mean_err:>8.4f} {ppl:>12.4f} {ppl-ppl_before:>+10.4f}")
+                  f"{mean_err:>8.4f} {ppl:>12.4f} {ppl-ppl_before:>+10.4f}  [{elapsed:.0f}s]")
+            sys.stdout.flush()
 
             torch.cuda.empty_cache() if torch.cuda.is_available() else None
         print()
