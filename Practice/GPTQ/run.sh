@@ -20,7 +20,7 @@ mkdir -p ~/Quantization/Practice/logs
 cd ~/Quantization/Practice/GPTQ
 
 python -u main_llama.py \
-    --model meta-llama/Llama-2-7b-hf \
+    --model ~/Quantization/Omni-Quant/OmniQuant/models/llama2-7b \
     --bits 4 \
     --rot hadamard \
     --groupsize 128 \
