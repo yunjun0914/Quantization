@@ -19,6 +19,7 @@ from transformers import OPTForCausalLM
 
 from gptq_rot import RotatedGPTQ
 from rotation import get_rotation, get_sign_vector, rotate_weight, unrotate_weight
+from svd_correction import apply_svd_corrections
 from data import get_loaders
 
 
@@ -195,6 +196,9 @@ def opt_rot_sequential(
             # V 흡수: W_final = Q @ V
             linears[name].weight.data = (Q.float() @ rotations[name][1].float()).to(Q.dtype)
 
+            # W_orig: V 흡수 전 원래 weight (SVD correction용)
+            W_orig_v = (linears[name].weight.data.float() @ rotations[name][1].float()).cpu().half()
+
             results[f"layer{layer_idx}.{name}"] = {
                 "Q":     Q.cpu(),
                 "scale": scale.cpu(),
@@ -202,6 +206,7 @@ def opt_rot_sequential(
                 "loss":  loss.mean().item(),
                 "U":     U.cpu(),
                 "V":     V.cpu(),
+                "W_orig": W_orig_v,
             }
             print(f"loss={loss.mean().item():.6f}")
             handler.free()
@@ -253,6 +258,7 @@ def run_opt_rot(
     rot_mode    = "random",
     dev         = "cpu",
     eval_before = True,
+    svd_rank    = 0,    # 0: SVD correction 없음, >0: rank-r correction
 ):
     print(f"Loading model: {model_name}")
     model = OPTForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16)
@@ -284,9 +290,20 @@ def run_opt_rot(
 
     # PPL 평가: W_corrected = U^T Q(UWV^T) V 적용 후 평가
     apply_corrections(model, results)
+
+    if svd_rank > 0:
+        print(f"\n[SVD correction] rank={svd_rank}")
+        apply_svd_corrections(
+            model, results,
+            get_layers_fn=get_opt_layers,
+            find_linears_fn=find_linear_layers,
+            rank=svd_rank,
+            verbose=True,
+        )
+
     model   = model.to(dev)
     ppl_q   = eval_ppl(model, testenc, dev, seqlen)
-    print(f"[{bits}bit RotatedGPTQ] PPL = {ppl_q:.2f}")
+    print(f"[{bits}bit RotatedGPTQ + SVD(rank={svd_rank})] PPL = {ppl_q:.2f}")
 
     return {"ppl_fp16": ppl_fp16, "ppl_quant": ppl_q, "results": results}
 

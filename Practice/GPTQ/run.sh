@@ -24,5 +24,5 @@ python -u main_llama.py \
     --bits 2 \
     --rot hadamard \
     --compare \
-    --groupsize 128 \
+    --svd_rank 1 \
     --dev cuda:0
