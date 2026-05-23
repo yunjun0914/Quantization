@@ -56,7 +56,9 @@ def get_rotations_v2(layer_idx, hidden, inter, rot_mode, seed, device):
     V_attn    = get_rotation(hidden, mode=rot_mode, seed=base+0, device=device)
     V_o       = get_rotation(hidden, mode=rot_mode, seed=base+1, device=device)
     V_gate_up = get_rotation(hidden, mode=rot_mode, seed=base+2, device=device)
-    V_down    = get_rotation(inter,  mode="random", seed=base+3, device=device)
+    # down_proj: inter=11008 → V(11008,11008) = OOM
+    # U=ones, V=ones(1D) → 양쪽 identity → down_proj는 사실상 rotation 없음
+    V_down_diag = torch.ones(inter, device=device)   # 1D → elementwise identity
 
     # U: Hadamard (hidden=4096=2^12) → 진짜 two-sided Hadamard rotation
     # U^T 보정이 inner loop에서 적용되므로 full matrix 가능
@@ -74,7 +76,7 @@ def get_rotations_v2(layer_idx, hidden, inter, rot_mode, seed, device):
         "self_attn.o_proj":  (U_ones_h,  V_o),       # U = +1 (1D ones)
         "mlp.gate_proj":     (U_gu,      V_gate_up),
         "mlp.up_proj":       (U_gu,      V_gate_up),
-        "mlp.down_proj":     (U_ones_h2, V_down),    # U = +1 (1D ones)
+        "mlp.down_proj":     (U_ones_h2, V_down_diag),  # U,V 모두 identity
     }
 
     # 흡수 정보: {layer_name: (target_name, side)}

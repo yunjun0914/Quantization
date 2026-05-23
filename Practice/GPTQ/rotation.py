@@ -147,16 +147,32 @@ def absorb_U_to_next(next_layer: nn.Linear, U: torch.Tensor):
 @torch.no_grad()
 def rotate_weight(W: torch.Tensor, U: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
     """
-    W_rot = diag(U) @ W @ V^T
-    U: (d_out,) sign vector
-    V: (d_in, d_in) orthogonal
+    W_rot = U @ W @ V^T
+    U: (d_out,) 1D vector 또는 (d_out, d_out) matrix
+    V: (d_in,)  1D vector 또는 (d_in, d_in)   matrix
+    1D인 경우 elementwise (identity로 쓸 수 있음)
     """
-    return (U.unsqueeze(1) * (W.float() @ V.t())).to(W.dtype)
+    # V 적용
+    if V.dim() == 1:
+        WVt = W.float() * V.unsqueeze(0)   # elementwise: W * v^T
+    else:
+        WVt = W.float() @ V.t()            # matmul: W @ V^T
+
+    # U 적용
+    if U.dim() == 1:
+        return (U.unsqueeze(1) * WVt).to(W.dtype)
+    else:
+        return (U.float() @ WVt).to(W.dtype)
 
 
 @torch.no_grad()
 def unrotate_weight(W_rot: torch.Tensor, U: torch.Tensor, V: torch.Tensor) -> torch.Tensor:
     """
-    W = diag(U)^T @ W_rot @ V  =  diag(U) @ W_rot @ V  (U^T = U since ±1)
+    W = U^T @ W_rot @ V
+    U: (d_out,) sign vector (U^T=U) 또는 (d_out, d_out) orthogonal (U^T=U.t())
     """
-    return (U.unsqueeze(1) * (W_rot.float() @ V)).to(W_rot.dtype)
+    W_vabs = W_rot.float() @ V
+    if U.dim() == 1:
+        return (U.unsqueeze(1) * W_vabs).to(W_rot.dtype)    # U^T = U for ±1
+    else:
+        return (U.t().float() @ W_vabs).to(W_rot.dtype)     # U^T @ W_rot @ V

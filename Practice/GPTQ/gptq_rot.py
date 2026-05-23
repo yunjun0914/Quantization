@@ -42,7 +42,11 @@ class RotatedGPTQ:
         """
         if inp.dim() == 3:
             inp = inp.reshape(-1, inp.shape[-1])
-        inp = self.V @ inp.float().t()   # V@X: (d_col, n)
+        inp = inp.float().t()            # (d_col, n)
+        if self.V.dim() == 2:
+            inp = self.V @ inp           # V@X: full rotation
+        else:
+            inp = self.V.unsqueeze(1) * inp  # elementwise: 1D V
         n   = inp.shape[1]
         self.H = (self.nsamples * self.H + 2 * inp @ inp.t()) / (self.nsamples + n)
         self.nsamples += n
