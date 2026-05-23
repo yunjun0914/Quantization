@@ -165,31 +165,8 @@ def llama_rot_sequential_v2(
             _, Vr = rotations[name]
             lin.weight.data = (Q_dict[name].float() @ Vr.float()).to(dtype)
 
-        # ── Step 5: U absorption ──────────────────────────────────────────
-        # U_v^T → o_proj columns: W_o @ U_v^T
-        if "self_attn.o_proj" in linears:
-            W_o = linears["self_attn.o_proj"].weight.data.float()
-            linears["self_attn.o_proj"].weight.data = (W_o @ U_v.t()).to(dtype)
-
-        # U_gu^T → down_proj columns: W_d @ U_gu^T
-        if "mlp.down_proj" in linears:
-            W_d = linears["mlp.down_proj"].weight.data.float()
-            linears["mlp.down_proj"].weight.data = (W_d @ U_gu.t()).to(dtype)
-
-        # U_d^T → 다음 layer input_layernorm weight에 흡수
-        # input_layernorm: y = gamma * norm(x)
-        # U_d가 output에 적용됐으므로 gamma에 U_d^T의 대각을 곱해 흡수
-        # U_d는 full orthogonal이라 대각만으로는 완전 흡수 불가
-        # → 다음 layer q/k/v/gate/up weight에 직접 U_d^T 흡수
-        if layer_idx < len(layers) - 1:
-            next_layer = layers[layer_idx + 1]
-            for next_name, next_lin in find_linear_layers(next_layer).items():
-                if next_name in ("self_attn.q_proj", "self_attn.k_proj",
-                                 "self_attn.v_proj", "mlp.gate_proj", "mlp.up_proj"):
-                    # W_next @ U_d^T: input에 U_d^T 흡수
-                    next_lin.weight.data = (
-                        next_lin.weight.data.float() @ U_d.to(next_lin.weight.device).t()
-                    ).to(dtype)
+        # Step 5 불필요: inner loop q = U^T @ Q(U @ WV^T) 이미 복원
+        # Step 4: Q @ V = U^T @ Q(U @ WV^T) @ V → inference x만 넣으면 ≈ Wx
 
         # ── 다음 layer 입력 업데이트 ──────────────────────────────────────
         for i in range(nsamples):
