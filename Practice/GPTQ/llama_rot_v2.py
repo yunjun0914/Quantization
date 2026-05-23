@@ -14,9 +14,9 @@ globally shared 이유:
 U 구조:
   q, k    → U_qk  (QK에서 U_qk² = I 자동 소거)
   v       → U_v   (o_proj columns에 흡수)
-  o_proj  → U_o   (다음 layer input_layernorm weight에 흡수)
   gate,up → U_gu  (down_proj columns에 흡수)
-  down    → U_d   (다음 layer post_attention_layernorm weight에 흡수)
+  o_proj  → U=identity (residual connection으로 absorption 불가, QuaRot 동일)
+  down    → U=identity (residual connection으로 absorption 불가, QuaRot 동일)
 
 V 흡수:
   모든 linear: W_stored = Q @ V  (inference 시 추가 matmul 없음)
@@ -66,9 +66,8 @@ def llama_rot_sequential_v2(
 
     U_qk = get_rotation(hidden, mode=rot_mode, seed=seed+10, device=device)
     U_v  = get_rotation(hidden, mode=rot_mode, seed=seed+11, device=device)
-    U_o  = get_sign_vector(hidden, seed=seed+12, device=device)
-    U_gu = get_sign_vector(inter,  seed=seed+13, device=device)
-    U_d  = get_sign_vector(hidden, seed=seed+14, device=device)
+    U_gu = get_sign_vector(inter, seed=seed+13, device=device)
+    U_id = torch.ones(hidden, device=device)   # identity: residual 때문에 U 불가
 
     print(f"  V_global ({hidden},{hidden})  V_inter ({inter},{inter})")
 
@@ -76,10 +75,10 @@ def llama_rot_sequential_v2(
         "self_attn.q_proj": (U_qk, V_global),
         "self_attn.k_proj": (U_qk, V_global),
         "self_attn.v_proj": (U_v,  V_global),
-        "self_attn.o_proj": (U_o,  V_global),
+        "self_attn.o_proj": (U_id, V_global),
         "mlp.gate_proj":    (U_gu, V_global),
         "mlp.up_proj":      (U_gu, V_global),
-        "mlp.down_proj":    (U_d,  V_inter),
+        "mlp.down_proj":    (U_id, V_inter),
     }
 
     # ── 입력 캡처 ─────────────────────────────────────────────────────────
@@ -132,15 +131,16 @@ def llama_rot_sequential_v2(
             layer(inps[i].unsqueeze(0).to(device), **kw)
         for h in hooks: h.remove()
 
-        # ── H diag stats (layer 0) ────────────────────────────────────────
-        if layer_idx == 0:
+        # ── H diag stats ──────────────────────────────────────────────────
+        if layer_idx in [0, 29, 30, 31]:
             print("  [H diag stats]")
             for name, handler in handlers.items():
                 Ht = handler.H.float()
-                if handler.V.dim() == 2:
-                    Ho = (handler.V.t() @ Ht @ handler.V).diag()
-                    print(f"    {name:25s}  H std={Ho.std():.2f} max={Ho.max():.2f} | "
-                          f"H̃ std={Ht.diag().std():.2f} max={Ht.diag().max():.2f}")
+                Ht_diag = Ht.diag()
+                n_zeros = (Ht_diag < 1e-8).sum().item()
+                print(f"    {name:25s}  "
+                      f"H̃ std={Ht_diag.std():.4f} max={Ht_diag.max():.4f} "
+                      f"min={Ht_diag.min():.6f} zeros={n_zeros}")
 
         # ── Step 2: V만 적용 ──────────────────────────────────────────────
         for name, lin in linears.items():
@@ -186,20 +186,7 @@ def llama_rot_sequential_v2(
             W_d = linears["mlp.down_proj"].weight.data.float()
             linears["mlp.down_proj"].weight.data = (W_d * U_gu.unsqueeze(0)).to(dtype)
 
-        # U_o → 다음 layer input_layernorm (globally shared V 덕분에 가능)
-        if hasattr(layer, 'post_attention_layernorm'):
-            layer.post_attention_layernorm.weight.data = (
-                layer.post_attention_layernorm.weight.data.float() * U_o.float()
-            ).to(dtype)
-
-        # U_d → 다음 layer input_layernorm
-        if layer_idx < len(layers) - 1:
-            next_layer = layers[layer_idx + 1].to(device)
-            if hasattr(next_layer, 'input_layernorm'):
-                next_layer.input_layernorm.weight.data = (
-                    next_layer.input_layernorm.weight.data.float() * U_d.float()
-                ).to(dtype)
-            next_layer = next_layer.cpu()
+        # U_o, U_d = identity (residual connection과 충돌하므로 적용 불가)
 
         # ── 다음 layer 입력 업데이트 ──────────────────────────────────────
         for i in range(nsamples):
