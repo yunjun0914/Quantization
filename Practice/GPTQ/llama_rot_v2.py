@@ -133,6 +133,12 @@ def llama_rot_sequential_v2(
             layer(inps[i].unsqueeze(0).to(device), **kw)
         for h in hooks: h.remove()
 
+        # dead channel 처리 강화: H̃ 대각이 0인 채널 제거
+        for name, handler in handlers.items():
+            dead = (torch.diag(handler.H) == 0)
+            if dead.any():
+                handler.H[dead, dead] = torch.diag(handler.H)[~dead].mean().clamp(min=1e-6)
+
         # ── H diag stats (layer 0) ────────────────────────────────────────
         if layer_idx == 0:
             print("  [H diag stats]")

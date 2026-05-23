@@ -79,7 +79,15 @@ class RotatedGPTQ:
         diag_idx = torch.arange(self.d_col, device=self.dev)
         H[diag_idx, diag_idx] += damp_val
 
-        L    = torch.linalg.cholesky(H)
+        # PD 보장: Cholesky 실패 시 damping 강화하여 재시도
+        for attempt in range(5):
+            try:
+                L = torch.linalg.cholesky(H)
+                break
+            except torch._C._LinAlgError:
+                H[diag_idx, diag_idx] += damp_val * (10 ** attempt)
+        else:
+            raise RuntimeError("Cholesky failed after 5 attempts. percdamp를 높여보세요.")
         Hinv = torch.cholesky_inverse(L)
         Hinv = torch.linalg.cholesky(Hinv, upper=True)
 
