@@ -205,7 +205,7 @@ def llama_rot_sequential_v2(
         print(f"  ↳ done in {time.time()-t0:.1f}s")
 
     model.config.use_cache = use_cache
-    return results
+    return results, U_gu
 
 
 @torch.no_grad()
@@ -242,7 +242,7 @@ def run_llama_rot_v2(
         model = model.cpu()
 
     t0      = time.time()
-    results = llama_rot_sequential_v2(
+    results, U_gu = llama_rot_sequential_v2(
         model, trainloader, dev,
         bits=bits, blocksize=blocksize, percdamp=percdamp,
         groupsize=groupsize, sym=sym, actorder=actorder,
