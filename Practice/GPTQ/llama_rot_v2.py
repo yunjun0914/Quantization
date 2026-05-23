@@ -30,7 +30,6 @@ from transformers import LlamaForCausalLM
 from gptq_rot import RotatedGPTQ
 from rotation import get_rotation, get_sign_vector, rotate_weight
 from data import get_loaders
-from svd_correction import apply_svd_corrections
 
 
 def get_llama_layers(model):
@@ -133,12 +132,6 @@ def llama_rot_sequential_v2(
             layer(inps[i].unsqueeze(0).to(device), **kw)
         for h in hooks: h.remove()
 
-        # dead channel 처리 강화: H̃ 대각이 0인 채널 제거
-        for name, handler in handlers.items():
-            dead = (torch.diag(handler.H) == 0)
-            if dead.any():
-                handler.H[dead, dead] = torch.diag(handler.H)[~dead].mean().clamp(min=1e-6)
-
         # ── H diag stats (layer 0) ────────────────────────────────────────
         if layer_idx == 0:
             print("  [H diag stats]")
@@ -167,7 +160,6 @@ def llama_rot_sequential_v2(
             results[f"layer{layer_idx}.{name}"] = {
                 "Q": Q.cpu(), "scale": scale.cpu(), "zero": zero.cpu(),
                 "loss": loss.mean().item(),
-                "W_orig": (linears[name].weight.data.float() @ rotations[name][1].float()).cpu().half(),
             }
             print(f"loss={loss.mean().item():.6f}")
             handler.free()
@@ -242,7 +234,7 @@ def run_llama_rot_v2(
     model_name="meta-llama/Llama-2-7b-hf", bits=4, dataset="wikitext2",
     nsamples=128, seqlen=2048, seed=0, blocksize=128, percdamp=0.01,
     groupsize=-1, sym=False, actorder=False, rot_mode="hadamard",
-    dev="cuda:0", eval_before=True, svd_rank=0,
+    dev="cuda:0", eval_before=True,
 ):
     print(f"Loading model: {model_name}")
     model = LlamaForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16)
@@ -266,18 +258,9 @@ def run_llama_rot_v2(
     )
     print(f"\n[RotatedGPTQ v2] Total time: {time.time()-t0:.1f}s")
 
-    if svd_rank > 0:
-        print(f"\n[SVD correction] rank={svd_rank}")
-        apply_svd_corrections(
-            model, results,
-            get_layers_fn=get_llama_layers,
-            find_linears_fn=find_linear_layers,
-            rank=svd_rank, verbose=True,
-        )
-
     model   = model.to(dev)
     ppl_q   = eval_ppl(model, testenc, dev, seqlen)
-    tag     = f"RotatedGPTQ v2 + SVD(r={svd_rank})" if svd_rank > 0 else "RotatedGPTQ v2"
+    tag     = "RotatedGPTQ v2"
     print(f"[{bits}bit {tag}] PPL = {ppl_q:.2f}")
 
     return {"ppl_fp16": ppl_fp16, "ppl_quant": ppl_q, "results": results}

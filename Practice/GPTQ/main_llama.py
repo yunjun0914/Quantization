@@ -12,6 +12,7 @@ LLaMA GPTQ / RotatedGPTQ entry point
 import argparse, torch
 from llama_rot import run_llama_rot
 from llama_rot_v2 import run_llama_rot_v2
+from llama_rot_v3 import run_llama_rot_v3
 from llama import run_llama
 
 
@@ -30,6 +31,7 @@ def parse_args():
     p.add_argument("--actorder",  action="store_true")
     p.add_argument("--rot",       type=str,   default="hadamard", choices=["random","hadamard"])
     p.add_argument("--v2",        action="store_true", help="Proper absorption (v2)")
+    p.add_argument("--v3",        action="store_true", help="Globally shared V (v3)")
     p.add_argument("--svd_rank",  type=int, default=0, help="SVD residual correction rank")
     p.add_argument("--dev",       type=str,   default="cuda:0")
     p.add_argument("--compare",   action="store_true")
@@ -40,13 +42,19 @@ if __name__ == "__main__":
     args = parse_args()
 
     print("=" * 60)
-    print(f"LLaMA Rotated GPTQ {'v2 (proper absorption)' if args.v2 else 'v1'}  |  김윤준")
+    ver = "v3 (globally shared V)" if args.v3 else ("v2 (proper absorption)" if args.v2 else "v1")
+    print(f"LLaMA Rotated GPTQ {ver}  |  김윤준")
     print("=" * 60)
     for k, v in vars(args).items():
         print(f"  {k:12s}: {v}")
     print("=" * 60)
 
-    runner = run_llama_rot_v2 if args.v2 else run_llama_rot
+    if args.v3:
+        runner = run_llama_rot_v3
+    elif args.v2:
+        runner = run_llama_rot_v2
+    else:
+        runner = run_llama_rot
     out_rot = runner(
         model_name=args.model, bits=args.bits, dataset=args.dataset,
         nsamples=args.nsamples, seqlen=args.seqlen, seed=args.seed,
