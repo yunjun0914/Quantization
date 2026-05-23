@@ -26,4 +26,5 @@ python -u main_llama.py \
     --v2\
     --compare \
     --svd_rank 1 \
-    --dev cuda:0
+    --percdamp 0.1 \
+    --dev cuda:0 
