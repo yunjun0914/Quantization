@@ -78,7 +78,7 @@ def llama_rot_sequential_v2(
         "self_attn.o_proj": (U_id, V_global),
         "mlp.gate_proj":    (U_gu, V_global),
         "mlp.up_proj":      (U_gu, V_global),
-        "mlp.down_proj":    (U_id, V_inter),
+        "mlp.down_proj":    (U_id, torch.ones(inter, device=device)),
     }
 
     # ── 입력 캡처 ─────────────────────────────────────────────────────────
