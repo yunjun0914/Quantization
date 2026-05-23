@@ -25,5 +25,5 @@ python -u main_llama.py \
     --rot hadamard \
     --v2\
     --compare \
-    --percdamp 0.01 \
+    --percdamp 0.1 \
     --dev cuda:0 
