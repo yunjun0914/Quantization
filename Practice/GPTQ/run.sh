@@ -21,7 +21,7 @@ cd ~/Quantization/Practice/GPTQ
 
 python -u main_llama.py \
     --model ~/Quantization/Omni-Quant/OmniQuant/models/llama2-7b \
-    --bits 2 \
+    --bits 4 \
     --rot hadamard \
     --v2\
     --compare \
