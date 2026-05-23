@@ -1,25 +1,13 @@
 """
-LLaMA Rotated GPTQ v2 - Globally Shared V & U
-===============================================
+LLaMA Rotated GPTQ v2
+======================
+QuaRot 구조 기반:
+  - V_global (Hadamard, hidden×hidden): 모든 linear에 동일하게 적용
+  - U_qk: q,k output rotation (QK에서 자동 소거)
+  - U_v:  v output rotation   (o_proj columns에 흡수)
+  - U_gu: gate,up output rotation (down_proj columns에 흡수)
 
-핵심 설계:
-  - V_global: 전체 모델 공유 (hidden × hidden, Hadamard)
-  - V_inter:  전체 모델 공유 (inter × inter, random)
-  - U: 6종 globally shared (layer마다 동일)
-
-globally shared 이유:
-  - V: hidden state가 항상 같은 회전 공간 → residual 문제 해결
-  - U: 랜덤 회전인데 layer마다 다르게 뽑을 이유 없음
-
-U 구조:
-  q, k    → U_qk  (QK에서 U_qk² = I 자동 소거)
-  v       → U_v   (o_proj columns에 흡수)
-  gate,up → U_gu  (down_proj columns에 흡수)
-  o_proj  → U=identity (residual connection으로 absorption 불가, QuaRot 동일)
-  down    → U=identity (residual connection으로 absorption 불가, QuaRot 동일)
-
-V 흡수:
-  모든 linear: W_stored = Q @ V  (inference 시 추가 matmul 없음)
+모든 rotation은 weight에 흡수 → inference 추가 비용 없음
 """
 
 import time
@@ -28,7 +16,7 @@ import torch.nn as nn
 from transformers import LlamaForCausalLM
 
 from gptq_rot import RotatedGPTQ
-from rotation import get_rotation, get_sign_vector, rotate_weight
+from rotation import get_rotation, get_sign_vector
 from data import get_loaders
 
 
@@ -48,37 +36,32 @@ def llama_rot_sequential_v2(
     rot_mode="hadamard", seed=0,
 ):
     print(f"[LLaMA RotatedGPTQ v2] bits={bits}  blocksize={blocksize}  rot={rot_mode}")
-    print(f"  Globally shared V & U")
     model.eval()
 
     layers = get_llama_layers(model)
     dtype  = next(iter(model.parameters())).dtype
     device = torch.device(dev)
     hidden = model.config.hidden_size       # 4096
-    inter  = model.config.intermediate_size  # 11008
 
     use_cache = model.config.use_cache
     model.config.use_cache = False
 
-    # ── Global V, U 생성 (한 번만) ───────────────────────────────────────
-    V_global = get_rotation(hidden, mode=rot_mode, seed=seed,   device=device)
-    V_inter  = get_rotation(inter,  mode="random", seed=seed+1, device=device)
+    # ── Global V, U (한 번만 생성) ────────────────────────────────────────
+    V = get_rotation(hidden, mode=rot_mode, seed=seed, device=device)   # (4096, 4096)
+    U_qk = get_rotation(hidden, mode=rot_mode, seed=seed+1, device=device)
+    U_v  = get_rotation(hidden, mode=rot_mode, seed=seed+2, device=device)
+    U_gu = get_sign_vector(hidden, seed=seed+3, device=device)
 
-    U_qk = get_rotation(hidden, mode=rot_mode, seed=seed+10, device=device)
-    U_v  = get_rotation(hidden, mode=rot_mode, seed=seed+11, device=device)
-    U_gu = get_sign_vector(inter, seed=seed+13, device=device)
-    U_id = torch.ones(hidden, device=device)   # identity: residual 때문에 U 불가
-
-    print(f"  V_global ({hidden},{hidden})  V_inter ({inter},{inter})")
-
+    # 모든 linear: V 동일하게 적용
+    # U는 absorption 가능한 것만
     rotations = {
-        "self_attn.q_proj": (U_qk, V_global),
-        "self_attn.k_proj": (U_qk, V_global),
-        "self_attn.v_proj": (U_v,  V_global),
-        "self_attn.o_proj": (U_id, V_global),
-        "mlp.gate_proj":    (U_gu, V_global),
-        "mlp.up_proj":      (U_gu, V_global),
-        "mlp.down_proj":    (U_id, torch.ones(inter, device=device)),
+        "self_attn.q_proj": (U_qk, V),
+        "self_attn.k_proj": (U_qk, V),
+        "self_attn.v_proj": (U_v,  V),
+        "self_attn.o_proj": (U_qk, V),  # U_qk: QK 이후 출력 공간
+        "mlp.gate_proj":    (U_gu, V),
+        "mlp.up_proj":      (U_gu, V),
+        "mlp.down_proj":    (U_gu, V),  # input이 gate/up output 공간
     }
 
     # ── 입력 캡처 ─────────────────────────────────────────────────────────
@@ -110,7 +93,7 @@ def llama_rot_sequential_v2(
         layer = layer.to(device)
         linears = find_linear_layers(layer)
 
-        # ── Step 1: Hessian 수집 (원래 weight) ───────────────────────────
+        # ── Step 1: Hessian 수집 ──────────────────────────────────────────
         handlers = {
             name: RotatedGPTQ(lin, *rotations[name])
             for name, lin in linears.items() if name in rotations
@@ -131,22 +114,21 @@ def llama_rot_sequential_v2(
             layer(inps[i].unsqueeze(0).to(device), **kw)
         for h in hooks: h.remove()
 
-        # ── H diag stats ──────────────────────────────────────────────────
-        if layer_idx in [0, 29, 30, 31]:
+        # ── H diag stats (layer 0) ────────────────────────────────────────
+        if layer_idx == 0:
             print("  [H diag stats]")
             for name, handler in handlers.items():
                 Ht = handler.H.float()
                 Ht_diag = Ht.diag()
-                n_zeros = (Ht_diag < 1e-8).sum().item()
                 print(f"    {name:25s}  "
                       f"H̃ std={Ht_diag.std():.4f} max={Ht_diag.max():.4f} "
-                      f"min={Ht_diag.min():.6f} zeros={n_zeros}")
+                      f"min={Ht_diag.min():.6f}")
 
-        # ── Step 2: V만 적용 ──────────────────────────────────────────────
+        # ── Step 2: V 적용 (W @ V^T) ─────────────────────────────────────
         for name, lin in linears.items():
             if name not in rotations: continue
-            _, V = rotations[name]
-            lin.weight.data = (lin.weight.data.float() @ V.t()).to(dtype)
+            _, Vr = rotations[name]
+            lin.weight.data = (lin.weight.data.float() @ Vr.t()).to(dtype)
 
         # ── Step 3: GPTQ 실행 ─────────────────────────────────────────────
         Q_dict = {}
@@ -164,29 +146,23 @@ def llama_rot_sequential_v2(
             print(f"loss={loss.mean().item():.6f}")
             handler.free()
 
-        # ── Step 4: V 흡수 ────────────────────────────────────────────────
+        # ── Step 4: V 흡수 (Q @ V) ───────────────────────────────────────
         for name, lin in linears.items():
             if name not in Q_dict: continue
-            Q   = Q_dict[name]
-            _, V = rotations[name]
-            W_v = (Q.float() @ V.float()).to(dtype)
-            lin.weight.data = W_v
+            _, Vr = rotations[name]
+            lin.weight.data = (Q_dict[name].float() @ Vr.float()).to(dtype)
 
         # ── Step 5: U 흡수 ────────────────────────────────────────────────
         # U_v → o_proj columns
         if "self_attn.o_proj" in linears:
             W_o = linears["self_attn.o_proj"].weight.data.float()
-            if U_v.dim() == 2:
-                linears["self_attn.o_proj"].weight.data = (W_o @ U_v.t()).to(dtype)
-            else:
-                linears["self_attn.o_proj"].weight.data = (W_o * U_v.unsqueeze(0)).to(dtype)
+            linears["self_attn.o_proj"].weight.data = (W_o @ U_v.t()).to(dtype)
 
-        # U_gu → down_proj columns (sign vector)
+        # U_gu → down_proj columns
         if "mlp.down_proj" in linears:
             W_d = linears["mlp.down_proj"].weight.data.float()
-            linears["mlp.down_proj"].weight.data = (W_d * U_gu.unsqueeze(0)).to(dtype)
-
-        # U_o, U_d = identity (residual connection과 충돌하므로 적용 불가)
+            linears["mlp.down_proj"].weight.data = (W_d @ U_gu.t() if U_gu.dim()==2
+                                                    else W_d * U_gu.unsqueeze(0)).to(dtype)
 
         # ── 다음 layer 입력 업데이트 ──────────────────────────────────────
         for i in range(nsamples):
@@ -247,7 +223,6 @@ def run_llama_rot_v2(
 
     model   = model.to(dev)
     ppl_q   = eval_ppl(model, testenc, dev, seqlen)
-    tag     = "RotatedGPTQ v2"
-    print(f"[{bits}bit {tag}] PPL = {ppl_q:.2f}")
+    print(f"[{bits}bit RotatedGPTQ v2] PPL = {ppl_q:.2f}")
 
     return {"ppl_fp16": ppl_fp16, "ppl_quant": ppl_q, "results": results}
