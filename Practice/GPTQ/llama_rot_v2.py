@@ -45,7 +45,7 @@ def llama_rot_sequential_v2(
     model, dataloader, dev,
     bits=4, blocksize=128, percdamp=0.01,
     groupsize=-1, sym=False, actorder=False,
-    rot_mode="hadamard", seed=0,
+    rot_mode="hadamard", seed=0, svd_rank=0,
 ):
     print(f"[LLaMA RotatedGPTQ v2] bits={bits}  blocksize={blocksize}  rot={rot_mode}")
     model.eval()
@@ -137,6 +137,19 @@ def llama_rot_sequential_v2(
                 d  = Ht.diag()
                 print(f"    {name:25s}  H̃ std={d.std():.4f}  max={d.max():.4f}  min={d.min():.6f}")
 
+        # ── W_orig 저장 (SVD correction용) ──────────────────────────────────
+        # 각 layer의 원래 weight를 V^T 공간으로 변환해서 저장
+        # (Step 4 후 W_stored와 같은 공간에서 잔차 계산하기 위해)
+        W_orig_dict = {}
+        for name, lin in linears.items():
+            if name not in rotations: continue
+            _, Vr = rotations[name]
+            if name == "mlp.down_proj":
+                # down_proj: W_stored는 Q(W @ U_gu^T), W_orig도 U_gu^T 공간
+                W_orig_dict[name] = (lin.weight.data.float() @ Vr.float()).cpu()
+            else:
+                W_orig_dict[name] = (lin.weight.data.float() @ Vr.float()).cpu()
+
         # ── Step 2: W @ V^T ───────────────────────────────────────────────
         for name, lin in linears.items():
             if name not in rotations: continue
@@ -172,6 +185,37 @@ def llama_rot_sequential_v2(
 
         # Step 5 불필요: inner loop q = U^T @ Q(U @ WV^T) 이미 복원
         # Step 4: Q @ V = U^T @ Q(U @ WV^T) @ V → inference x만 넣으면 ≈ Wx
+
+        # ── Step 5: SVD Residual Correction ──────────────────────────────────
+        if svd_rank > 0:
+            for name, lin in linears.items():
+                if name not in Q_dict: continue
+                W_orig = W_orig_dict[name].to(device).float()  # V^T 공간 원본
+                W_stored = lin.weight.data.float()             # Q @ V 저장 상태
+
+                # 잔차: 같은 V^T 공간에서 비교
+                # W_orig = W @ V^T (V^T 공간)
+                # W_stored = U^T @ Q(U @ WV^T) @ V (원래 공간 복원)
+                # 비교를 위해 W_stored도 V^T 공간으로
+                _, Vr = rotations[name]
+                if name == "mlp.down_proj":
+                    W_stored_vspace = W_stored  # 이미 U_gu^T 공간
+                else:
+                    W_stored_vspace = W_stored.float() @ Vr.float().t()
+
+                R = W_orig - W_stored_vspace  # 잔차 (V^T 공간)
+                U_svd, S_svd, Vt_svd = torch.linalg.svd(R, full_matrices=False)
+                U_r  = U_svd[:, :svd_rank]
+                S_r  = S_svd[:svd_rank]
+                Vt_r = Vt_svd[:svd_rank, :]
+
+                # 보정: W_stored_vspace에 더한 뒤 다시 원래 공간으로
+                R_approx = U_r @ torch.diag(S_r) @ Vt_r
+                if name == "mlp.down_proj":
+                    lin.weight.data = (W_stored + R_approx).to(dtype)
+                else:
+                    # V^T 공간 보정 → 원래 공간으로: R_approx @ V
+                    lin.weight.data = (W_stored + R_approx @ Vr.float()).to(dtype)
 
         # ── 다음 layer 입력 업데이트 ──────────────────────────────────────
         # R4(U_gu) online: down_proj 앞에 U_gu를 fp32로 적용
@@ -226,7 +270,7 @@ def run_llama_rot_v2(
     model_name="meta-llama/Llama-2-7b-hf", bits=4, dataset="wikitext2",
     nsamples=128, seqlen=2048, seed=0, blocksize=128, percdamp=0.01,
     groupsize=-1, sym=False, actorder=False, rot_mode="hadamard",
-    dev="cuda:0", eval_before=True,
+    dev="cuda:0", eval_before=True, svd_rank=0,
 ):
     print(f"Loading model: {model_name}")
     model = LlamaForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16)
@@ -246,7 +290,7 @@ def run_llama_rot_v2(
         model, trainloader, dev,
         bits=bits, blocksize=blocksize, percdamp=percdamp,
         groupsize=groupsize, sym=sym, actorder=actorder,
-        rot_mode=rot_mode, seed=seed,
+        rot_mode=rot_mode, seed=seed, svd_rank=svd_rank,
     )
     print(f"\n[RotatedGPTQ v2] Total time: {time.time()-t0:.1f}s")
 
