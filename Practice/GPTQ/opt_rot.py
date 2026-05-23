@@ -159,9 +159,11 @@ def opt_rot_sequential(
         for h in hooks:
             h.remove()
 
-        # ── Step 2: Hessian 수집 완료 후 weight rotate ────────────────────
+        # ── Step 2: V만 적용 (U는 inner loop에서 매 column마다 적용)
+        # W_stored = W @ V^T  (V만 흡수, U는 RotatedGPTQ 내부에서 처리)
         for name, lin in linears.items():
-            lin.weight.data = rotate_weight(lin.weight.data, *rotations[name])
+            U, V = rotations[name]
+            lin.weight.data = (lin.weight.data.float() @ V.t()).to(lin.weight.dtype)
 
         # ── RotatedGPTQ 실행 ──────────────────────────────────────────────
         Q_store = {}   # name → Q(UWV^T)  (최종 inference용)
@@ -189,7 +191,9 @@ def opt_rot_sequential(
             # ── 핵심 수정 ──────────────────────────────────────────────────
             # 다음 layer 입력 업데이트용: U^T Q(UWV^T) V ≈ W  (원래 공간 복원)
             # → forward pass가 올바른 activation을 다음 layer에 전달
-            linears[name].weight.data = unrotate_weight(Q, U, V)
+            # Q는 이미 W 공간 (U^T @ Q_rot 복원됨)
+            # V 흡수: W_final = Q @ V
+            linears[name].weight.data = (Q.float() @ rotations[name][1].float()).to(Q.dtype)
 
             results[f"layer{layer_idx}.{name}"] = {
                 "Q":     Q.cpu(),
@@ -320,6 +324,7 @@ def apply_corrections(model, results: dict):
             U = results[key]["U"].to(lin.weight.device).float()
             V = results[key]["V"].to(lin.weight.device).float()
 
-            lin.weight.data = unrotate_weight(Q, U, V)
+            # Q는 W 공간, V 흡수
+            lin.weight.data = (Q.float() @ V.float()).to(lin.weight.dtype)
 
-    print("[absorption] W_corrected = U^T Q(UWV^T) V 적용 완료  (V 공유 기반)")
+    print("[absorption] V absorbed: W_final = Q @ V")

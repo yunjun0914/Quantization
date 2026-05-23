@@ -1,12 +1,16 @@
 """
-Rotated GPTQ Core
-==================
-기존 gptq.py와 동일하나 Hessian에 V 회전 적용:
+Rotated GPTQ Core v2
+=====================
+목적함수: L = ||[UWV^T - Q(UWV^T)] VX||_F^2
 
-    H̃ = V H V^T
-
-weight는 이미 rotate_weight()로 UWV^T 상태로 들어옴.
-GPTQ는 회전된 공간에서 동작.
+핵심 설계:
+  - H̃ = VHV^T: add_batch에서 V@X로 직접 수집
+  - W는 W 공간 유지 (WV^T 상태)
+  - 매 column 양자화 시에만 U 회전 적용:
+      col_rot = U @ col  →  Q(col_rot)  →  q = U^T @ q_rot
+  - 오차는 W 공간에서 전파:
+      err = (col - q) / d
+  - H̃^{-1}은 그대로 사용 (U: d_row 방향, H̃^{-1}: d_col 방향으로 독립)
 """
 
 import math
@@ -16,14 +20,6 @@ from quantize import quantize, find_params
 
 
 class RotatedGPTQ:
-    """
-    하나의 Linear layer를 Rotated GPTQ로 양자화.
-
-    사용법:
-        handler = RotatedGPTQ(layer, U, V)
-        handler.add_batch(inp, out)   # Hessian 누적 (원래 공간 입력)
-        Q, scale, zero, loss = handler.quantize(bits=4)
-    """
 
     def __init__(self, layer: nn.Linear, U: torch.Tensor, V: torch.Tensor):
         self.layer = layer
@@ -33,23 +29,21 @@ class RotatedGPTQ:
         W = layer.weight.data
         self.d_row, self.d_col = W.shape
 
-        self.U = U.to(self.dev).float()   # (d_row,) sign vector
-        self.V = V.to(self.dev).float()   # (d_col, d_col) orthogonal
+        self.U = U.to(self.dev).float()
+        self.V = V.to(self.dev).float()
 
-        # Hessian H = 2 X X^T  (원래 공간)
         self.H        = torch.zeros((self.d_col, self.d_col), device=self.dev)
         self.nsamples = 0
 
     def add_batch(self, inp: torch.Tensor, out: torch.Tensor):
         """
-        V @ X 로 회전된 입력으로 Hessian 직접 계산.
-        H̃ = 2(VX)(VX)^T = V(2XX^T)V^T = VHV^T
-        → quantize()에서 별도 VHV^T 변환 불필요.
+        H̃ = VHV^T 직접 수집.
+        inp = X (원래 공간) → V@X → H̃ = 2(VX)(VX)^T
         """
         if inp.dim() == 3:
             inp = inp.reshape(-1, inp.shape[-1])
-        inp = self.V @ inp.float().t()   # (d_col, n_tokens) → V @ X
-        n = inp.shape[1]
+        inp = self.V @ inp.float().t()   # V@X: (d_col, n)
+        n   = inp.shape[1]
         self.H = (self.nsamples * self.H + 2 * inp @ inp.t()) / (self.nsamples + n)
         self.nsamples += n
 
@@ -63,24 +57,20 @@ class RotatedGPTQ:
         actorder:  bool  = False,
     ):
         """
-        Rotated GPTQ Algorithm 1:
-          1. W_rot = U * W * V^T  (이미 layer.weight에 반영되어 있어야 함)
-          2. H̃ = V H V^T
-          3. 회전된 공간에서 GPTQ 실행
-          4. Q_rot 반환 (layer.weight에 덮어씌움)
+        W 공간 유지 + 매 column 양자화 시에만 U 회전.
+
+        layer.weight는 WV^T 상태로 들어와야 함.
+        (rotate_weight에서 U@W@V^T로 회전하지 않고 W@V^T만 적용)
         """
-        # ── W_rot: 이미 layer.weight = UWV^T 상태라고 가정 ──────────────────
-        W = self.layer.weight.data.clone().float()   # (d_row, d_col) = UWV^T
+        W = self.layer.weight.data.clone().float()   # (d_row, d_col) = WV^T
+        H = self.H.float()                           # H̃ = VHV^T
 
-        # H̃ = VHV^T: add_batch에서 이미 V@X로 누적 → 그대로 사용
-        H = self.H.float()
-
-        # ── dead weight ────────────────────────────────────────────────────
+        # ── dead weight ───────────────────────────────────────────────────
         dead = (torch.diag(H) == 0)
         H[dead, dead] = 1.0
         W[:, dead]    = 0.0
 
-        # ── Cholesky Reformulation ─────────────────────────────────────────
+        # ── Cholesky ─────────────────────────────────────────────────────
         damp_val = percdamp * torch.mean(torch.diag(H))
         diag_idx = torch.arange(self.d_col, device=self.dev)
         H[diag_idx, diag_idx] += damp_val
@@ -89,7 +79,7 @@ class RotatedGPTQ:
         Hinv = torch.cholesky_inverse(L)
         Hinv = torch.linalg.cholesky(Hinv, upper=True)
 
-        # ── actorder ───────────────────────────────────────────────────────
+        # ── actorder ─────────────────────────────────────────────────────
         if actorder:
             perm    = torch.argsort(torch.diag(H), descending=True)
             W       = W[:, perm]
@@ -98,27 +88,28 @@ class RotatedGPTQ:
         else:
             perm = invperm = None
 
-        # ── groupsize scale/zero 저장 ───────────────────────────────────────
-        maxq = 2 ** bits - 1
+        # ── groupsize ────────────────────────────────────────────────────
+        maxq     = 2 ** bits - 1
         n_groups = math.ceil(self.d_col / groupsize) if groupsize > 0 else 1
-
         scale_all = torch.zeros((self.d_row, n_groups), device=self.dev)
         zero_all  = torch.zeros((self.d_row, n_groups), device=self.dev)
 
         if groupsize <= 0:
-            scale, zero = find_params(W, bits, perchannel=True, sym=sym)
+            # scale/zero는 U 회전 후 분포 기준으로 계산
+            W_rot_full = self._apply_U(W)
+            scale, zero = find_params(W_rot_full, bits, perchannel=True, sym=sym)
             scale_all[:, 0] = scale.squeeze(1)
             zero_all[:, 0]  = zero.squeeze(1)
 
         Q      = torch.zeros_like(W)
         Losses = torch.zeros_like(W)
 
-        # ── Algorithm 1 (회전된 공간) ───────────────────────────────────────
+        # ── Algorithm 1 ──────────────────────────────────────────────────
         for i1 in range(0, self.d_col, blocksize):
             i2    = min(i1 + blocksize, self.d_col)
             count = i2 - i1
 
-            W1    = W[:, i1:i2].clone()
+            W1    = W[:, i1:i2].clone()    # W 공간
             Q1    = torch.zeros_like(W1)
             Err1  = torch.zeros_like(W1)
             Loss1 = torch.zeros_like(W1)
@@ -126,15 +117,15 @@ class RotatedGPTQ:
 
             for j_loc in range(count):
                 j_global = i1 + j_loc
-                col      = W1[:, j_loc]
+                col      = W1[:, j_loc]    # W 공간 column (d_row,)
                 d        = Hinv1[j_loc, j_loc]
 
                 if groupsize > 0 and j_global % groupsize == 0:
-                    g_idx  = j_global // groupsize
-                    g_end  = min(j_global + groupsize, self.d_col)
-                    scale, zero = find_params(
-                        W[:, j_global:g_end], bits, perchannel=True, sym=sym
-                    )
+                    g_idx = j_global // groupsize
+                    g_end = min(j_global + groupsize, self.d_col)
+                    # scale/zero: U 회전 후 분포 기준
+                    W_rot_g = self._apply_U(W[:, j_global:g_end])
+                    scale, zero = find_params(W_rot_g, bits, perchannel=True, sym=sym)
                     scale_all[:, g_idx] = scale.squeeze(1)
                     zero_all[:, g_idx]  = zero.squeeze(1)
                 elif groupsize <= 0:
@@ -142,13 +133,19 @@ class RotatedGPTQ:
                     scale = scale_all[:, 0:1]
                     zero  = zero_all[:, 0:1]
 
-                q = quantize(
-                    col.unsqueeze(-1), scale, zero, maxq
-                ).squeeze(-1)
+                # ── 핵심: 양자화 시에만 U 회전 ──────────────────────────
+                col_rot = self._apply_U(col.unsqueeze(1)).squeeze(1)  # U @ col
+                q_rot   = quantize(col_rot.unsqueeze(-1), scale, zero, maxq).squeeze(-1)
+                q       = self._apply_Ut(q_rot.unsqueeze(1)).squeeze(1)  # U^T @ q_rot
 
                 Q1[:, j_loc]    = q
-                err             = (col - q) / d
+
+                # W 공간 순수 오차
+                err             = (col - q) / d       # (d_row,)
                 Loss1[:, j_loc] = err ** 2
+
+                # W 공간에서 전파, H̃^{-1} 그대로
+                # (U: d_row 방향, H̃^{-1}: d_col 방향 → 독립)
                 W1[:, j_loc:]  -= torch.ger(err, Hinv1[j_loc, j_loc:])
                 Err1[:, j_loc]  = err
 
@@ -164,6 +161,20 @@ class RotatedGPTQ:
         zero_all  = zero_all.to(self.dtype)
 
         return Q, scale_all, zero_all, Losses
+
+    def _apply_U(self, x: torch.Tensor) -> torch.Tensor:
+        """U @ x. U가 vector(±1)면 elementwise, matrix면 matmul."""
+        if self.U.dim() == 1:
+            return self.U.unsqueeze(1) * x   # diag(U) @ x
+        else:
+            return self.U @ x               # full matrix
+
+    def _apply_Ut(self, x: torch.Tensor) -> torch.Tensor:
+        """U^T @ x."""
+        if self.U.dim() == 1:
+            return self.U.unsqueeze(1) * x   # U^T = U for ±1
+        else:
+            return self.U.t() @ x
 
     def free(self):
         del self.H
