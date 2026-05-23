@@ -1,25 +1,25 @@
 """
-LLaMA Rotated GPTQ v2 - Proper Absorption
-==========================================
+LLaMA Rotated GPTQ v2 - Globally Shared V & U
+===============================================
 
-기존 문제: unrotate_weight = U^T @ Q @ V 를 fp16으로 저장
-          → 자체 정밀도 문제는 없지만, V matmul이 한 번 더 발생
+핵심 설계:
+  - V_global: 전체 모델 공유 (hidden × hidden, Hadamard)
+  - V_inter:  전체 모델 공유 (inter × inter, random)
+  - U: 6종 globally shared (layer마다 동일)
 
-v2 전략: V를 weight에 흡수(Q @ V, fp32), U는 인접 레이어에 흡수
-         → inference 시 추가 연산 없음, 오차 원인 제거
+globally shared 이유:
+  - V: hidden state가 항상 같은 회전 공간 → residual 문제 해결
+  - U: 랜덤 회전인데 layer마다 다르게 뽑을 이유 없음
 
-U 흡수 규칙 (LLaMA 구조 기준):
-  q, k   → 같은 U_qk 공유: (U⊙q)@(U⊙k)^T = q@k^T  (U²=1 소거) ✓
-  v      → U_v를 o_proj columns에 흡수:
-            o_proj[:,j] *= U_v[j]  →  o_proj @ (U_v⊙v) = (o_proj*U_v) @ v ✓
-  gate,up → 같은 U_gu 공유: SiLU(U⊙g)*(U⊙u) → down_proj columns에 흡수:
-            down_proj[:,j] *= U_gu[j]  →  down_proj @ (U_gu⊙swiglu) ✓
-  o_proj  → output이 residual에 더해짐 → U = +1 (identity)
-  down    → output이 residual에 더해짐 → U = +1 (identity)
+U 구조:
+  q, k    → U_qk  (QK에서 U_qk² = I 자동 소거)
+  v       → U_v   (o_proj columns에 흡수)
+  o_proj  → U_o   (다음 layer input_layernorm weight에 흡수)
+  gate,up → U_gu  (down_proj columns에 흡수)
+  down    → U_d   (다음 layer post_attention_layernorm weight에 흡수)
 
 V 흡수:
-  모든 linear: W_stored = Q(UWV^T) @ V  (fp32 계산, fp16 저장)
-  → inference 시 W_stored @ x = Q(UWV^T) @ V @ x  (추가 matmul 없음)
+  모든 linear: W_stored = Q @ V  (inference 시 추가 matmul 없음)
 """
 
 import time
@@ -28,9 +28,9 @@ import torch.nn as nn
 from transformers import LlamaForCausalLM
 
 from gptq_rot import RotatedGPTQ
-from svd_correction import apply_svd_corrections
 from rotation import get_rotation, get_sign_vector, rotate_weight
 from data import get_loaders
+from svd_correction import apply_svd_corrections
 
 
 def get_llama_layers(model):
@@ -41,53 +41,6 @@ def find_linear_layers(layer):
     return {name: m for name, m in layer.named_modules() if isinstance(m, nn.Linear)}
 
 
-def get_rotations_v2(layer_idx, hidden, inter, rot_mode, seed, device):
-    """
-    V 공유 + U 흡수 가능한 구조로 rotation 생성.
-
-    U 규칙:
-      q, k  → U_qk (공유, QK에서 소거)
-      v     → U_v  (o_proj에 흡수)
-      gate, up → U_gu (공유, down_proj에 흡수)
-      o_proj, down_proj → U = +1 (identity, residual 때문)
-    """
-    base = seed + layer_idx * 20
-
-    V_attn    = get_rotation(hidden, mode=rot_mode, seed=base+0, device=device)
-    V_o       = get_rotation(hidden, mode=rot_mode, seed=base+1, device=device)
-    V_gate_up = get_rotation(hidden, mode=rot_mode, seed=base+2, device=device)
-    # down_proj: inter=11008 → V(11008,11008) = OOM
-    # U=ones, V=ones(1D) → 양쪽 identity → down_proj는 사실상 rotation 없음
-    V_down_diag = torch.ones(inter, device=device)   # 1D → elementwise identity
-
-    # U: Hadamard (hidden=4096=2^12) → 진짜 two-sided Hadamard rotation
-    # U^T 보정이 inner loop에서 적용되므로 full matrix 가능
-    U_qk     = get_rotation(hidden, mode="hadamard", seed=base+10, device=device)  # (hidden, hidden)
-    U_v      = get_rotation(hidden, mode="hadamard", seed=base+11, device=device)
-    U_gu     = get_rotation(inter,  mode="random",   seed=base+12, device=device)  # inter는 random
-    # o_proj, down_proj: U = identity → sign vector ones로 처리
-    U_ones_h  = torch.ones(hidden, device=device)   # o_proj: identity (1D)
-    U_ones_h2 = torch.ones(hidden, device=device)   # down_proj: identity (1D)
-
-    rotations = {
-        "self_attn.q_proj":  (U_qk,      V_attn),
-        "self_attn.k_proj":  (U_qk,      V_attn),
-        "self_attn.v_proj":  (U_v,       V_attn),
-        "self_attn.o_proj":  (U_ones_h,  V_o),       # U = +1 (1D ones)
-        "mlp.gate_proj":     (U_gu,      V_gate_up),
-        "mlp.up_proj":       (U_gu,      V_gate_up),
-        "mlp.down_proj":     (U_ones_h2, V_down_diag),  # U,V 모두 identity
-    }
-
-    # 흡수 정보: {layer_name: (target_name, side)}
-    absorb_map = {
-        "self_attn.v_proj": ("self_attn.o_proj", "col"),   # U_v → o_proj columns
-        "mlp.gate_proj":    ("mlp.down_proj",    "col"),   # U_gu → down_proj columns
-    }
-
-    return rotations, absorb_map, {"U_v": U_v, "U_gu": U_gu}
-
-
 @torch.no_grad()
 def llama_rot_sequential_v2(
     model, dataloader, dev,
@@ -96,24 +49,45 @@ def llama_rot_sequential_v2(
     rot_mode="hadamard", seed=0,
 ):
     print(f"[LLaMA RotatedGPTQ v2] bits={bits}  blocksize={blocksize}  rot={rot_mode}")
-    print(f"  V absorbed into weights (fp32), U absorbed into adjacent layers")
+    print(f"  Globally shared V & U")
     model.eval()
 
-    layers   = get_llama_layers(model)
-    dtype    = next(iter(model.parameters())).dtype
-    device   = torch.device(dev)
+    layers = get_llama_layers(model)
+    dtype  = next(iter(model.parameters())).dtype
+    device = torch.device(dev)
+    hidden = model.config.hidden_size       # 4096
+    inter  = model.config.intermediate_size  # 11008
 
     use_cache = model.config.use_cache
     model.config.use_cache = False
 
+    # ── Global V, U 생성 (한 번만) ───────────────────────────────────────
+    V_global = get_rotation(hidden, mode=rot_mode, seed=seed,   device=device)
+    V_inter  = get_rotation(inter,  mode="random", seed=seed+1, device=device)
+
+    U_qk = get_rotation(hidden, mode=rot_mode, seed=seed+10, device=device)
+    U_v  = get_rotation(hidden, mode=rot_mode, seed=seed+11, device=device)
+    U_o  = get_sign_vector(hidden, seed=seed+12, device=device)
+    U_gu = get_sign_vector(inter,  seed=seed+13, device=device)
+    U_d  = get_sign_vector(hidden, seed=seed+14, device=device)
+
+    print(f"  V_global ({hidden},{hidden})  V_inter ({inter},{inter})")
+
+    rotations = {
+        "self_attn.q_proj": (U_qk, V_global),
+        "self_attn.k_proj": (U_qk, V_global),
+        "self_attn.v_proj": (U_v,  V_global),
+        "self_attn.o_proj": (U_o,  V_global),
+        "mlp.gate_proj":    (U_gu, V_global),
+        "mlp.up_proj":      (U_gu, V_global),
+        "mlp.down_proj":    (U_d,  V_inter),
+    }
+
     # ── 입력 캡처 ─────────────────────────────────────────────────────────
     nsamples = len(dataloader)
     seqlen   = dataloader[0].shape[1]
-    inps     = torch.zeros(
-        (nsamples, seqlen, model.config.hidden_size),
-        dtype=dtype, device="cpu",
-    )
-    cache = {"i": 0, "position_ids": None}
+    inps     = torch.zeros((nsamples, seqlen, hidden), dtype=dtype, device="cpu")
+    cache    = {"i": 0, "position_ids": None}
 
     class CatchInput(nn.Module):
         def __init__(self, m): super().__init__(); self.module = m
@@ -130,9 +104,7 @@ def llama_rot_sequential_v2(
     layers[0] = layers[0].module; model.model.layers[0] = layers[0]
     model = model.cpu(); torch.cuda.empty_cache()
 
-    results  = {}
-    hidden   = model.config.hidden_size
-    inter    = model.config.intermediate_size
+    results = {}
 
     for layer_idx, layer in enumerate(layers):
         print(f"\n[Layer {layer_idx:02d}/{len(layers)-1}]")
@@ -140,16 +112,10 @@ def llama_rot_sequential_v2(
         layer = layer.to(device)
         linears = find_linear_layers(layer)
 
-        # ── rotation 생성 ──────────────────────────────────────────────────
-        rotations, absorb_map, u_vecs = get_rotations_v2(
-            layer_idx, hidden, inter, rot_mode, seed, device
-        )
-
-        # ── Step 1: 원래 weight로 Hessian 수집 ───────────────────────────
+        # ── Step 1: Hessian 수집 (원래 weight) ───────────────────────────
         handlers = {
             name: RotatedGPTQ(lin, *rotations[name])
-            for name, lin in linears.items()
-            if name in rotations
+            for name, lin in linears.items() if name in rotations
         }
 
         hooks = []
@@ -167,25 +133,23 @@ def llama_rot_sequential_v2(
             layer(inps[i].unsqueeze(0).to(device), **kw)
         for h in hooks: h.remove()
 
-        # ── Step 2: weight rotate ─────────────────────────────────────────
-        for name, lin in linears.items():
-            if name in rotations:
-                lin.weight.data = rotate_weight(lin.weight.data, *rotations[name])
-
-        # ── Step 3: GPTQ 실행 ─────────────────────────────────────────────
+        # ── H diag stats (layer 0) ────────────────────────────────────────
         if layer_idx == 0:
             print("  [H diag stats]")
             for name, handler in handlers.items():
                 Ht = handler.H.float()
                 if handler.V.dim() == 2:
-                    Ho_diag = (handler.V.t() @ Ht @ handler.V).diag()
-                    print(f"    {name:25s}  H std={Ho_diag.std():.2f} max={Ho_diag.max():.2f} | "
-                          f"H̃ std={Ht.diag().std():.2f} max={Ht.diag().max():.2f}")
-                else:
-                    # V가 1D (identity) → H̃ ≈ H
-                    print(f"    {name:25s}  V=identity  "
+                    Ho = (handler.V.t() @ Ht @ handler.V).diag()
+                    print(f"    {name:25s}  H std={Ho.std():.2f} max={Ho.max():.2f} | "
                           f"H̃ std={Ht.diag().std():.2f} max={Ht.diag().max():.2f}")
 
+        # ── Step 2: V만 적용 ──────────────────────────────────────────────
+        for name, lin in linears.items():
+            if name not in rotations: continue
+            _, V = rotations[name]
+            lin.weight.data = (lin.weight.data.float() @ V.t()).to(dtype)
+
+        # ── Step 3: GPTQ 실행 ─────────────────────────────────────────────
         Q_dict = {}
         for name, handler in handlers.items():
             print(f"  quantizing {name:30s} ... ", end="", flush=True)
@@ -202,39 +166,42 @@ def llama_rot_sequential_v2(
             print(f"loss={loss.mean().item():.6f}")
             handler.free()
 
-        # ── Step 4: V 흡수 (핵심) ─────────────────────────────────────────
-        # W_stored = Q @ V  (fp32 계산, fp16 저장)
-        # inference: W_stored @ x = Q(UWV^T) @ V @ x  ✓  (추가 matmul 없음)
+        # ── Step 4: V 흡수 ────────────────────────────────────────────────
         for name, lin in linears.items():
             if name not in Q_dict: continue
-            Q = Q_dict[name]
-            U, V = rotations[name]
-            # Q @ V: V 흡수 (fp32)
-            W_v_abs = (Q.float() @ V.float()).to(dtype)
-            lin.weight.data = W_v_abs
+            Q   = Q_dict[name]
+            _, V = rotations[name]
+            W_v = (Q.float() @ V.float()).to(dtype)
+            lin.weight.data = W_v
 
-        # ── Step 5: U 흡수 ─────────────────────────────────────────────────
+        # ── Step 5: U 흡수 ────────────────────────────────────────────────
         # U_v → o_proj columns
-        # U_v가 full matrix이면: o_proj_new = o_proj @ U_v^T
-        # U_v가 vector(±1)이면: o_proj[:,j] *= U_v[j]
-        if "self_attn.o_proj" in linears and "self_attn.v_proj" in linears:
-            U_v = u_vecs["U_v"]
+        if "self_attn.o_proj" in linears:
             W_o = linears["self_attn.o_proj"].weight.data.float()
             if U_v.dim() == 2:
-                W_o_new = W_o @ U_v.t()   # o_proj @ U_v^T
+                linears["self_attn.o_proj"].weight.data = (W_o @ U_v.t()).to(dtype)
             else:
-                W_o_new = W_o * U_v.unsqueeze(0)
-            linears["self_attn.o_proj"].weight.data = W_o_new.to(dtype)
+                linears["self_attn.o_proj"].weight.data = (W_o * U_v.unsqueeze(0)).to(dtype)
 
-        # U_gu → down_proj columns
-        if "mlp.down_proj" in linears and "mlp.gate_proj" in linears:
-            U_gu = u_vecs["U_gu"]
+        # U_gu → down_proj columns (sign vector)
+        if "mlp.down_proj" in linears:
             W_d = linears["mlp.down_proj"].weight.data.float()
-            if U_gu.dim() == 2:
-                W_d_new = W_d @ U_gu.t()
-            else:
-                W_d_new = W_d * U_gu.unsqueeze(0)
-            linears["mlp.down_proj"].weight.data = W_d_new.to(dtype)
+            linears["mlp.down_proj"].weight.data = (W_d * U_gu.unsqueeze(0)).to(dtype)
+
+        # U_o → 다음 layer input_layernorm (globally shared V 덕분에 가능)
+        if hasattr(layer, 'post_attention_layernorm'):
+            layer.post_attention_layernorm.weight.data = (
+                layer.post_attention_layernorm.weight.data.float() * U_o.float()
+            ).to(dtype)
+
+        # U_d → 다음 layer input_layernorm
+        if layer_idx < len(layers) - 1:
+            next_layer = layers[layer_idx + 1].to(device)
+            if hasattr(next_layer, 'input_layernorm'):
+                next_layer.input_layernorm.weight.data = (
+                    next_layer.input_layernorm.weight.data.float() * U_d.float()
+                ).to(dtype)
+            next_layer = next_layer.cpu()
 
         # ── 다음 layer 입력 업데이트 ──────────────────────────────────────
         for i in range(nsamples):
@@ -299,8 +266,7 @@ def run_llama_rot_v2(
             model, results,
             get_layers_fn=get_llama_layers,
             find_linears_fn=find_linear_layers,
-            rank=svd_rank,
-            verbose=True,
+            rank=svd_rank, verbose=True,
         )
 
     model   = model.to(dev)
