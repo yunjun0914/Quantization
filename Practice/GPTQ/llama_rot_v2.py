@@ -160,21 +160,46 @@ def llama_rot_sequential_v2(
             handler.free()
 
         # ── Step 4: V 흡수 (Q @ V) ───────────────────────────────────────
+        # down_proj: R4(U_gu)는 online → Q만 저장 (@ U_gu 안 함)
+        # 나머지: Q @ V 저장
         for name, lin in linears.items():
             if name not in Q_dict: continue
             _, Vr = rotations[name]
-            lin.weight.data = (Q_dict[name].float() @ Vr.float()).to(dtype)
+            if name == "mlp.down_proj":
+                lin.weight.data = Q_dict[name]  # Q(W_down @ U_gu^T) 그대로
+            else:
+                lin.weight.data = (Q_dict[name].float() @ Vr.float()).to(dtype)
 
         # Step 5 불필요: inner loop q = U^T @ Q(U @ WV^T) 이미 복원
         # Step 4: Q @ V = U^T @ Q(U @ WV^T) @ V → inference x만 넣으면 ≈ Wx
 
         # ── 다음 layer 입력 업데이트 ──────────────────────────────────────
+        # R4(U_gu) online: down_proj 앞에 U_gu를 fp32로 적용
+        # hook으로 down_proj input에 U_gu 적용
+        U_gu_dev = U_gu.to(device)
+        def make_r4_hook(U):
+            def hook(m, inp):
+                x = inp[0].float()
+                # x: (batch, seq, inter) or (batch, inter)
+                if x.dim() == 3:
+                    x = (U @ x.reshape(-1, x.shape[-1]).t()).t().reshape(*x.shape)
+                else:
+                    x = (U @ x.t()).t()
+                return (x.to(inp[0].dtype),)
+            return hook
+
+        if "mlp.down_proj" in linears:
+            r4_hook = linears["mlp.down_proj"].register_forward_pre_hook(make_r4_hook(U_gu_dev))
+
         for i in range(nsamples):
             kw = {}
             if cache["position_ids"] is not None:
                 kw["position_ids"] = cache["position_ids"].to(device)
             out   = layer(inps[i].unsqueeze(0).to(device), **kw)
             inps[i] = out[0].detach().cpu()
+
+        if "mlp.down_proj" in linears:
+            r4_hook.remove()
 
         layer = layer.cpu(); torch.cuda.empty_cache()
         print(f"  ↳ done in {time.time()-t0:.1f}s")
@@ -225,8 +250,30 @@ def run_llama_rot_v2(
     )
     print(f"\n[RotatedGPTQ v2] Total time: {time.time()-t0:.1f}s")
 
+    # R4 online: 모든 layer down_proj 앞에 U_gu hook 등록
+    U_gu_cpu = U_gu.cpu()
+    r4_hooks = []
+    for layer in get_llama_layers(model):
+        linears = find_linear_layers(layer)
+        if "mlp.down_proj" in linears:
+            def make_r4_hook(U):
+                def hook(m, inp):
+                    x = inp[0].float()
+                    if x.dim() == 3:
+                        x = (U.to(x.device) @ x.reshape(-1, x.shape[-1]).t()).t().reshape(*x.shape)
+                    else:
+                        x = (U.to(x.device) @ x.t()).t()
+                    return (x.to(inp[0].dtype),)
+                return hook
+            r4_hooks.append(
+                linears["mlp.down_proj"].register_forward_pre_hook(make_r4_hook(U_gu_cpu))
+            )
+
     model   = model.to(dev)
     ppl_q   = eval_ppl(model, testenc, dev, seqlen)
     print(f"[{bits}bit RotatedGPTQ v2] PPL = {ppl_q:.2f}")
+
+    for h in r4_hooks:
+        h.remove()
 
     return {"ppl_fp16": ppl_fp16, "ppl_quant": ppl_q, "results": results}
