@@ -1,24 +1,25 @@
 """
 LLaMA Rotated GPTQ v2
 ======================
-QuaRot 구조 기반 (R1=V_global, R2=U_v, R3=U_qk, R4=U_gu)
+QuaRot 구조 기반 (R1=V, R2=U_v, R3=U_qk, R4=U_gu, R5=U_d)
 
 weight 흡수:
-  q_proj:    U_qk @ W @ V^T   (U=R3, V=R1^-1)
+  q_proj:    U_qk @ W @ V^T
   k_proj:    U_qk @ W @ V^T
-  v_proj:    U_v  @ W @ V^T   (U=R2, V=R1^-1)
-  o_proj:    W @ V @ U_v^T    (V=R1, U_v^T=R2^-1 columns 흡수)
-  gate_proj: W @ V^T          (V=R1^-1)
-  up_proj:   W @ V^T
-  down_proj: W @ V @ U_gu^T   (V=R1, U_gu^T=R4^-1 columns 흡수)
+  v_proj:    U_v  @ W @ V^T
+  o_proj:    U_qk @ W @ V^T  → U_v^T absorbed into columns
+  gate_proj: U_gu @ W @ V^T
+  up_proj:   U_gu @ W @ V^T
+  down_proj: U_d  @ W @ U_gu^T → U_gu^T absorbed into columns, U_d^T into next layernorm
 
 복원:
-  U_qk: QK^T에서 U_qk U_qk^T = I 자동 소거
-  U_v:  o_proj에서 U_v^T U_v = I 소거
-  U_gu: down_proj에서 U_gu^T U_gu = I 소거
+  U_qk: QK^T에서 자동 소거
+  U_v:  o_proj columns에 U_v^T 흡수
+  U_gu: down_proj columns에 U_gu^T 흡수
+  U_d:  다음 layer input_layernorm weight에 U_d^T 흡수
   V:    chain으로 V V^T = I 소거
 
-추가 inference 비용 없음.
+R1(V) absorbable → hidden state 항상 원래 공간 → residual 문제없음
 """
 
 import time
@@ -27,7 +28,7 @@ import torch.nn as nn
 from transformers import LlamaForCausalLM
 
 from gptq_rot import RotatedGPTQ
-from rotation import get_rotation, get_sign_vector
+from rotation import get_rotation
 from data import get_loaders
 
 
@@ -62,21 +63,20 @@ def llama_rot_sequential_v2(
     V    = get_rotation(hidden, mode=rot_mode, seed=seed,   device=device)  # R1
     U_qk = get_rotation(hidden, mode=rot_mode, seed=seed+1, device=device)  # R3
     U_v  = get_rotation(hidden, mode=rot_mode, seed=seed+2, device=device)  # R2
-    U_gu = get_rotation(inter, mode=rot_mode, seed=seed+3, device=device)   # R4 (full)
+    U_gu = get_rotation(inter,  mode=rot_mode, seed=seed+3, device=device)  # R4
+    U_d  = get_rotation(hidden, mode=rot_mode, seed=seed+4, device=device)  # R5
 
-    print(f"  V({hidden},{hidden})  U_qk({hidden},{hidden})  U_v({hidden},{hidden})  U_gu({inter},)")
+    print(f"  V({hidden},{hidden})  U_qk({hidden},{hidden})  U_v({hidden},{hidden})")
+    print(f"  U_gu({inter},{inter})  U_d({hidden},{hidden})")
 
-    # GPTQ inner loop용: (U, V) 쌍
-    # q/k/v: U@W@V^T 형태로 양자화
-    # o/gate/up/down: U=None (inner loop에서 회전 없음, absorption만)
     rotations = {
         "self_attn.q_proj": (U_qk, V),
         "self_attn.k_proj": (U_qk, V),
         "self_attn.v_proj": (U_v,  V),
-        "self_attn.o_proj": (None, V),
-        "mlp.gate_proj":    (None, V),
-        "mlp.up_proj":      (None, V),
-        "mlp.down_proj":    (None, U_gu),  # V=U_gu (input 공간 rotation)
+        "self_attn.o_proj": (U_qk, V),
+        "mlp.gate_proj":    (U_gu, V),
+        "mlp.up_proj":      (U_gu, V),
+        "mlp.down_proj":    (U_d,  U_gu),
     }
 
     # ── 입력 캡처 ─────────────────────────────────────────────────────────
@@ -109,14 +109,10 @@ def llama_rot_sequential_v2(
         linears = find_linear_layers(layer)
 
         # ── Step 1: Hessian 수집 ──────────────────────────────────────────
-        # U=None인 layer도 V rotation은 적용 → add_batch에서 V@X
-        handlers = {}
-        for name, lin in linears.items():
-            if name not in rotations: continue
-            U, Vr = rotations[name]
-            if Vr is None: continue  # down_proj: GPTQ 없이 absorption만
-            U_eff = U if U is not None else torch.ones(lin.weight.shape[0], device=device)
-            handlers[name] = RotatedGPTQ(lin, U_eff, Vr)
+        handlers = {
+            name: RotatedGPTQ(lin, *rotations[name])
+            for name, lin in linears.items() if name in rotations
+        }
 
         hooks = []
         for name, lin in linears.items():
@@ -145,7 +141,6 @@ def llama_rot_sequential_v2(
         for name, lin in linears.items():
             if name not in rotations: continue
             _, Vr = rotations[name]
-            if Vr is None: continue
             lin.weight.data = (lin.weight.data.float() @ Vr.t()).to(dtype)
 
         # ── Step 3: GPTQ 실행 ─────────────────────────────────────────────
@@ -168,10 +163,7 @@ def llama_rot_sequential_v2(
         for name, lin in linears.items():
             if name not in Q_dict: continue
             _, Vr = rotations[name]
-            if Vr is None:
-                lin.weight.data = Q_dict[name]
-            else:
-                lin.weight.data = (Q_dict[name].float() @ Vr.float()).to(dtype)
+            lin.weight.data = (Q_dict[name].float() @ Vr.float()).to(dtype)
 
         # ── Step 5: U absorption ──────────────────────────────────────────
         # U_v^T → o_proj columns: W_o @ U_v^T
@@ -179,14 +171,21 @@ def llama_rot_sequential_v2(
             W_o = linears["self_attn.o_proj"].weight.data.float()
             linears["self_attn.o_proj"].weight.data = (W_o @ U_v.t()).to(dtype)
 
-        # down_proj: V@W@U_gu^T
-        #   output방향: V (row) → V @ W_down
-        #   input방향:  U_gu^T (column, sign) → * U_gu elementwise
+        # U_gu^T → down_proj columns: W_d @ U_gu^T
         if "mlp.down_proj" in linears:
             W_d = linears["mlp.down_proj"].weight.data.float()
-            W_d = V.float() @ W_d           # V @ W: (4096,4096)@(4096,11008)
-            W_d = W_d * U_gu.unsqueeze(0)   # U_gu^T: (4096,11008)*(1,11008)
-            linears["mlp.down_proj"].weight.data = W_d.to(dtype)
+            linears["mlp.down_proj"].weight.data = (W_d @ U_gu.t()).to(dtype)
+
+        # U_d^T → 다음 layer input_layernorm weight에 흡수
+        # down_proj output이 U_d 공간 → 다음 layer input에 U_d^T 필요
+        if layer_idx < len(layers) - 1:
+            next_layer = layers[layer_idx + 1]
+            if hasattr(next_layer, 'input_layernorm'):
+                next_layer.input_layernorm.weight.data = (
+                    next_layer.input_layernorm.weight.data.float() * U_d.diag() 
+                    if U_d.dim() == 2
+                    else next_layer.input_layernorm.weight.data.float() * U_d
+                ).to(dtype)
 
         # ── 다음 layer 입력 업데이트 ──────────────────────────────────────
         for i in range(nsamples):
