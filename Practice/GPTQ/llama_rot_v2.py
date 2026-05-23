@@ -177,15 +177,19 @@ def llama_rot_sequential_v2(
             linears["mlp.down_proj"].weight.data = (W_d @ U_gu.t()).to(dtype)
 
         # U_d^T → 다음 layer input_layernorm weight에 흡수
-        # down_proj output이 U_d 공간 → 다음 layer input에 U_d^T 필요
+        # input_layernorm: y = gamma * norm(x)
+        # U_d가 output에 적용됐으므로 gamma에 U_d^T의 대각을 곱해 흡수
+        # U_d는 full orthogonal이라 대각만으로는 완전 흡수 불가
+        # → 다음 layer q/k/v/gate/up weight에 직접 U_d^T 흡수
         if layer_idx < len(layers) - 1:
             next_layer = layers[layer_idx + 1]
-            if hasattr(next_layer, 'input_layernorm'):
-                next_layer.input_layernorm.weight.data = (
-                    next_layer.input_layernorm.weight.data.float() * U_d.diag() 
-                    if U_d.dim() == 2
-                    else next_layer.input_layernorm.weight.data.float() * U_d
-                ).to(dtype)
+            for next_name, next_lin in find_linear_layers(next_layer).items():
+                if next_name in ("self_attn.q_proj", "self_attn.k_proj",
+                                 "self_attn.v_proj", "mlp.gate_proj", "mlp.up_proj"):
+                    # W_next @ U_d^T: input에 U_d^T 흡수
+                    next_lin.weight.data = (
+                        next_lin.weight.data.float() @ U_d.to(next_lin.weight.device).t()
+                    ).to(dtype)
 
         # ── 다음 layer 입력 업데이트 ──────────────────────────────────────
         for i in range(nsamples):
