@@ -62,7 +62,7 @@ def llama_rot_sequential_v2(
     V    = get_rotation(hidden, mode=rot_mode, seed=seed,   device=device)  # R1
     U_qk = get_rotation(hidden, mode=rot_mode, seed=seed+1, device=device)  # R3
     U_v  = get_rotation(hidden, mode=rot_mode, seed=seed+2, device=device)  # R2
-    U_gu = get_sign_vector(inter, seed=seed+3, device=device)               # R4 (sign)
+    U_gu = get_rotation(inter, mode=rot_mode, seed=seed+3, device=device)   # R4 (full)
 
     print(f"  V({hidden},{hidden})  U_qk({hidden},{hidden})  U_v({hidden},{hidden})  U_gu({inter},)")
 
@@ -76,7 +76,7 @@ def llama_rot_sequential_v2(
         "self_attn.o_proj": (None, V),
         "mlp.gate_proj":    (None, V),
         "mlp.up_proj":      (None, V),
-        "mlp.down_proj":    (None, None),  # V=output방향, U_gu=column → Step4,5에서 별도 처리
+        "mlp.down_proj":    (None, U_gu),  # V=U_gu (input 공간 rotation)
     }
 
     # ── 입력 캡처 ─────────────────────────────────────────────────────────

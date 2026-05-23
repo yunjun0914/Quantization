@@ -57,40 +57,33 @@ def _hadamard_pow2(d: int, device="cpu") -> torch.Tensor:
     return H / math.sqrt(d)
 
 
-def get_hadamard(d: int, device="cpu") -> torch.Tensor:
+def get_hadamard(d: int, device="cpu", seed: int = 0) -> torch.Tensor:
     """
-    Block Hadamard matrix. V^T V = I.
-    d가 2의 거듭제곱이면 전체 Hadamard.
-    아니면 가장 큰 2^k 블록으로 block-diagonal 구성.
-      ex) d=768  = 3 x 256  -> 3개의 256x256 블록
-          d=3072 = 3 x 1024 -> 3개의 1024x1024 블록
+    Randomized Hadamard (QuaRot 방식).
+    d가 2의 거듭제곱이면 exact Hadamard.
+    아니면 random orthogonal (QR) 사용 - padding submatrix는 orthogonal 보장 불가.
+    randomized: diag(±1) @ H @ diag(±1)
     """
     if d > 0 and (d & (d - 1)) == 0:
-        return _hadamard_pow2(d, device=device)
-
-    # 가장 큰 2^k 블록 탐색 (d를 나누어야 함)
-    block = 1
-    while block * 2 <= d:
-        block *= 2
-    while block > 1 and d % block != 0:
-        block //= 2
-
-    if block <= 1:
-        return get_random_orthogonal(d, seed=0, device=device)
-
-    H_block = _hadamard_pow2(block, device=device)
-    n_blocks = d // block
-    return torch.block_diag(*[H_block for _ in range(n_blocks)])
-
+        H = _hadamard_pow2(d, device=device)
+        # randomize
+        g = torch.Generator(device=device); g.manual_seed(seed)
+        dl = (torch.randint(0, 2, (d,), generator=g, device=device).float() * 2 - 1)
+        g.manual_seed(seed + 1)
+        dr = (torch.randint(0, 2, (d,), generator=g, device=device).float() * 2 - 1)
+        return dl.unsqueeze(1) * H * dr.unsqueeze(0)
+    else:
+        # d가 2의 거듭제곱 아님 → random orthogonal
+        return get_random_orthogonal(d, seed=seed, device=device)
 
 def get_rotation(d: int, mode: str = "random", seed: int = 0, device="cpu") -> torch.Tensor:
     """
     V 생성.
     mode: "random" | "hadamard"
-    hadamard: d가 2의 거듭제곱 또는 그 배수일 때 block-diagonal Hadamard.
+    hadamard: padding 기반 randomized Hadamard (임의 d 지원)
     """
     if mode == "hadamard":
-        return get_hadamard(d, device=device)
+        return get_hadamard(d, device=device, seed=seed)
     else:
         return get_random_orthogonal(d, seed=seed, device=device)
 
