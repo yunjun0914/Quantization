@@ -63,17 +63,18 @@ def get_rotations_v2(layer_idx, hidden, inter, rot_mode, seed, device):
     U_qk     = get_rotation(hidden, mode="hadamard", seed=base+10, device=device)  # (hidden, hidden)
     U_v      = get_rotation(hidden, mode="hadamard", seed=base+11, device=device)
     U_gu     = get_rotation(inter,  mode="random",   seed=base+12, device=device)  # inter는 random
-    U_ones_h  = torch.eye(hidden, device=device)   # o_proj: identity
-    U_ones_h2 = torch.eye(hidden, device=device)   # down_proj: identity
+    # o_proj, down_proj: U = identity → sign vector ones로 처리
+    U_ones_h  = torch.ones(hidden, device=device)   # o_proj: identity (1D)
+    U_ones_h2 = torch.ones(hidden, device=device)   # down_proj: identity (1D)
 
     rotations = {
         "self_attn.q_proj":  (U_qk,      V_attn),
-        "self_attn.k_proj":  (U_qk,      V_attn),    # q와 동일 U_qk
+        "self_attn.k_proj":  (U_qk,      V_attn),
         "self_attn.v_proj":  (U_v,       V_attn),
-        "self_attn.o_proj":  (U_ones_h,  V_o),       # U = +1
+        "self_attn.o_proj":  (U_ones_h,  V_o),       # U = +1 (1D ones)
         "mlp.gate_proj":     (U_gu,      V_gate_up),
-        "mlp.up_proj":       (U_gu,      V_gate_up), # gate와 동일 U_gu
-        "mlp.down_proj":     (U_ones_h2, V_down),    # U = +1
+        "mlp.up_proj":       (U_gu,      V_gate_up),
+        "mlp.down_proj":     (U_ones_h2, V_down),    # U = +1 (1D ones)
     }
 
     # 흡수 정보: {layer_name: (target_name, side)}
