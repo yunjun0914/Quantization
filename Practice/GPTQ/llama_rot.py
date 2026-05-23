@@ -253,6 +253,7 @@ def run_llama_rot(
     rot_mode    = "hadamard",
     dev         = "cuda:0",
     eval_before = True,
+    svd_rank    = 0,
 ):
     print(f"Loading model: {model_name}")
     model = LlamaForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16)
