@@ -177,9 +177,14 @@ def llama_rot_sequential_v2(
             print("  [H diag stats]")
             for name, handler in handlers.items():
                 Ht = handler.H.float()
-                Ho = (handler.V.t() @ Ht @ handler.V).diag()
-                print(f"    {name:25s}  H std={Ho.std():.2f} max={Ho.max():.2f} | "
-                      f"H̃ std={Ht.diag().std():.2f} max={Ht.diag().max():.2f}")
+                if handler.V.dim() == 2:
+                    Ho_diag = (handler.V.t() @ Ht @ handler.V).diag()
+                    print(f"    {name:25s}  H std={Ho_diag.std():.2f} max={Ho_diag.max():.2f} | "
+                          f"H̃ std={Ht.diag().std():.2f} max={Ht.diag().max():.2f}")
+                else:
+                    # V가 1D (identity) → H̃ ≈ H
+                    print(f"    {name:25s}  V=identity  "
+                          f"H̃ std={Ht.diag().std():.2f} max={Ht.diag().max():.2f}")
 
         Q_dict = {}
         for name, handler in handlers.items():
