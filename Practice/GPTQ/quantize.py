@@ -13,6 +13,49 @@ import torch.nn as nn
 # Low-level quantize / dequantize
 # ─────────────────────────────────────────────────────────────────────────────
 
+# NF2 고정 grid (Gaussian quantile 기반, [-1, 1] 정규화)
+NF2_GRID = torch.tensor([-1.0, -0.2767, 0.2767, 1.0], dtype=torch.float32)
+NF4_GRID = torch.tensor([
+    -1.0, -0.6962, -0.5251, -0.3949, -0.2767, -0.1691, -0.0626,
+     0.0626,  0.1691,  0.2767,  0.3949,  0.5251,  0.6962,  1.0,
+    -0.6962, -0.5251  # padding to 16
+], dtype=torch.float32)
+
+
+def quantize_nf(x: torch.Tensor, scale: torch.Tensor, nf_grid: torch.Tensor) -> torch.Tensor:
+    """
+    NormalFloat quantization.
+    scale: (d_row, 1) absmax scale
+    nf_grid: 고정 quantization 값들 (k개)
+
+    x를 [-1, 1]로 정규화 후 nearest neighbor lookup, dequantize.
+    """
+    grid = nf_grid.to(x.device)
+    x_norm = x / scale.clamp(min=1e-8)                   # (d_row, d_col)
+    x_norm = x_norm.clamp(-1, 1)
+
+    # nearest neighbor: (d_row, d_col, k) → argmin
+    dists = (x_norm.unsqueeze(-1) - grid.unsqueeze(0).unsqueeze(0)) ** 2
+    idx   = dists.argmin(dim=-1)                          # (d_row, d_col)
+    x_q   = grid[idx]                                     # (d_row, d_col)
+    return x_q * scale                                    # dequantize
+
+
+def find_params_nf(x: torch.Tensor, perchannel: bool = True) -> torch.Tensor:
+    """
+    NF quantization용 absmax scale 계산.
+    Returns: scale (d_row, 1)
+    """
+    if perchannel:
+        x_flat = x.float().reshape(x.shape[0], -1)
+    else:
+        x_flat = x.float().flatten().unsqueeze(0)
+    scale = x_flat.abs().max(dim=1, keepdim=True).values.clamp(min=1e-8)
+    if perchannel:
+        return scale                  # (d_row, 1)
+    return scale.reshape(1, 1)
+
+
 def quantize(x: torch.Tensor, scale: torch.Tensor, zero: torch.Tensor, maxq: int) -> torch.Tensor:
     """
     Uniform quantization:  Q = clamp( round(x / scale) + zero,  0,  maxq )
