@@ -45,7 +45,7 @@ def llama_rot_sequential_v2(
     model, dataloader, dev,
     bits=4, blocksize=128, percdamp=0.01,
     groupsize=-1, sym=False, actorder=False,
-    rot_mode="hadamard", seed=0, svd_rank=0,
+    rot_mode="hadamard", seed=0,
 ):
     print(f"[LLaMA RotatedGPTQ v2] bits={bits}  blocksize={blocksize}  rot={rot_mode}")
     model.eval()
@@ -137,16 +137,6 @@ def llama_rot_sequential_v2(
                 d  = Ht.diag()
                 print(f"    {name:25s}  H̃ std={d.std():.4f}  max={d.max():.4f}  min={d.min():.6f}")
 
-        # ── W_orig 저장 (SVD correction용) ──────────────────────────────────
-        # 각 layer의 원래 weight를 V^T 공간으로 변환해서 저장
-        # (Step 4 후 W_stored와 같은 공간에서 잔차 계산하기 위해)
-        W_orig_dict = {}
-        for name, lin in linears.items():
-            if name not in rotations: continue
-            _, Vr = rotations[name]
-            # fp32로 계산 (fp16 precision loss 방지)
-            W_orig_dict[name] = (lin.weight.data.float() @ Vr.float().t()).cpu()  # V^T 공간으로 저장
-
         # ── Step 2: W @ V^T ───────────────────────────────────────────────
         for name, lin in linears.items():
             if name not in rotations: continue
@@ -182,47 +172,6 @@ def llama_rot_sequential_v2(
 
         # Step 5 불필요: inner loop q = U^T @ Q(U @ WV^T) 이미 복원
         # Step 4: Q @ V = U^T @ Q(U @ WV^T) @ V → inference x만 넣으면 ≈ Wx
-
-        # ── Step 5: SVD Residual Correction ──────────────────────────────────
-        if svd_rank > 0:
-            for name, lin in linears.items():
-                if name not in Q_dict: continue
-                W_orig = W_orig_dict[name].to(device).float()  # V^T 공간 원본
-                W_stored = lin.weight.data.float()             # Q @ V 저장 상태
-
-                # 순수 양자화 오차 = UWV^T 공간에서의 잔차
-                # W_stored = U^T @ Q(U @ WV^T) @ V
-                # U @ W_stored @ V^T = Q(U @ WV^T)
-                # W_orig_vspace = W @ V^T → U @ W_orig_vspace = U @ W @ V^T
-                # R = U @ W @ V^T - Q(U @ WV^T) : 순수 양자화 오차 (UWV^T 공간)
-                _, Vr = rotations[name]
-                U_rot, _ = rotations[name]
-
-                if name == "mlp.down_proj":
-                    # W_stored = Q(W @ U_gu^T): U_gu^T 공간
-                    # U_rot @ W_stored = U_d @ Q(W @ U_gu^T)
-                    # W_orig = W @ U_gu^T
-                    # U_rot @ W_orig = U_d @ W @ U_gu^T
-                    R = (U_rot @ W_orig.to(device)) - (U_rot @ W_stored)
-                else:
-                    # R = U @ W @ V^T - Q(U @ WV^T)
-                    #   = U @ W_orig - U @ W_stored @ V^T
-                    R = (U_rot @ W_orig.to(device)) - (U_rot @ (W_stored @ Vr.float().t()))
-
-                U_svd, S_svd, Vt_svd = torch.linalg.svd(R, full_matrices=False)
-                U_r  = U_svd[:, :svd_rank]
-                S_r  = S_svd[:svd_rank]
-                Vt_r = Vt_svd[:svd_rank, :]
-                R_approx = U_r @ torch.diag(S_r) @ Vt_r  # UWV^T 공간
-
-                if name == "mlp.down_proj":
-                    # R_approx은 U_d @ (U_gu^T 공간)
-                    # W_stored에 더하려면 U_d^T @ R_approx
-                    lin.weight.data = (W_stored + U_rot.t() @ R_approx).to(dtype)
-                else:
-                    # R_approx은 U @ (V^T 공간)
-                    # W_stored에 더하려면 U^T @ R_approx @ V
-                    lin.weight.data = (W_stored + U_rot.t() @ R_approx @ Vr.float()).to(dtype)
 
         # ── 다음 layer 입력 업데이트 ──────────────────────────────────────
         # R4(U_gu) online: down_proj 앞에 U_gu를 fp32로 적용
@@ -277,7 +226,7 @@ def run_llama_rot_v2(
     model_name="meta-llama/Llama-2-7b-hf", bits=4, dataset="wikitext2",
     nsamples=128, seqlen=2048, seed=0, blocksize=128, percdamp=0.01,
     groupsize=-1, sym=False, actorder=False, rot_mode="hadamard",
-    dev="cuda:0", eval_before=True, svd_rank=0,
+    dev="cuda:0", eval_before=True,
 ):
     print(f"Loading model: {model_name}")
     model = LlamaForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16)
@@ -297,7 +246,7 @@ def run_llama_rot_v2(
         model, trainloader, dev,
         bits=bits, blocksize=blocksize, percdamp=percdamp,
         groupsize=groupsize, sym=sym, actorder=actorder,
-        rot_mode=rot_mode, seed=seed, svd_rank=svd_rank,
+        rot_mode=rot_mode, seed=seed,
     )
     print(f"\n[RotatedGPTQ v2] Total time: {time.time()-t0:.1f}s")
 
