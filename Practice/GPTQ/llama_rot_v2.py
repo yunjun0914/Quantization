@@ -190,35 +190,39 @@ def llama_rot_sequential_v2(
                 W_orig = W_orig_dict[name].to(device).float()  # V^T 공간 원본
                 W_stored = lin.weight.data.float()             # Q @ V 저장 상태
 
-                # 잔차: 같은 V^T 공간에서 비교
-                # W_orig = W @ V^T (V^T 공간)
-                # W_stored = U^T @ Q(U @ WV^T) @ V (원래 공간 복원)
-                # 비교를 위해 W_stored도 V^T 공간으로
+                # 순수 양자화 오차 = UWV^T 공간에서의 잔차
+                # W_stored = U^T @ Q(U @ WV^T) @ V
+                # U @ W_stored @ V^T = Q(U @ WV^T)
+                # W_orig_vspace = W @ V^T → U @ W_orig_vspace = U @ W @ V^T
+                # R = U @ W @ V^T - Q(U @ WV^T) : 순수 양자화 오차 (UWV^T 공간)
                 _, Vr = rotations[name]
-                if name == "mlp.down_proj":
-                    W_stored_vspace = W_stored  # 이미 U_gu^T 공간
-                else:
-                    W_stored_vspace = W_stored.float() @ Vr.float().t()
+                U_rot, _ = rotations[name]
 
-                R = W_orig - W_stored_vspace  # 잔차 (V^T 공간)
+                if name == "mlp.down_proj":
+                    # W_stored = Q(W @ U_gu^T): U_gu^T 공간
+                    # U_rot @ W_stored = U_d @ Q(W @ U_gu^T)
+                    # W_orig = W @ U_gu^T
+                    # U_rot @ W_orig = U_d @ W @ U_gu^T
+                    R = (U_rot @ W_orig.to(device)) - (U_rot @ W_stored)
+                else:
+                    # R = U @ W @ V^T - Q(U @ WV^T)
+                    #   = U @ W_orig - U @ W_stored @ V^T
+                    R = (U_rot @ W_orig.to(device)) - (U_rot @ (W_stored @ Vr.float().t()))
+
                 U_svd, S_svd, Vt_svd = torch.linalg.svd(R, full_matrices=False)
                 U_r  = U_svd[:, :svd_rank]
                 S_r  = S_svd[:svd_rank]
                 Vt_r = Vt_svd[:svd_rank, :]
+                R_approx = U_r @ torch.diag(S_r) @ Vt_r  # UWV^T 공간
 
-                # 보정: W_stored_vspace에 더한 뒤 다시 원래 공간으로
-                R_approx = U_r @ torch.diag(S_r) @ Vt_r
                 if name == "mlp.down_proj":
-                    # W_stored = Q(W @ U_gu^T): U_gu^T 공간
-                    # inference: W_stored @ (U_gu @ swiglu) ≈ W @ swiglu
-                    # SVD 보정: R은 U_gu^T 공간 → W_stored에 직접 더하면 됨
-                    # R_approx @ U_gu @ swiglu가 되므로 올바른 보정
-                    lin.weight.data = (W_stored + R_approx).to(dtype)
+                    # R_approx은 U_d @ (U_gu^T 공간)
+                    # W_stored에 더하려면 U_d^T @ R_approx
+                    lin.weight.data = (W_stored + U_rot.t() @ R_approx).to(dtype)
                 else:
-                    # W_stored = U^T @ Q(U @ WV^T) @ V: 원래 공간
-                    # W_stored_vspace = W_stored @ V^T: V^T 공간
-                    # R_approx도 V^T 공간 → 원래 공간으로: R_approx @ V
-                    lin.weight.data = (W_stored + R_approx @ Vr.float()).to(dtype)
+                    # R_approx은 U @ (V^T 공간)
+                    # W_stored에 더하려면 U^T @ R_approx @ V
+                    lin.weight.data = (W_stored + U_rot.t() @ R_approx @ Vr.float()).to(dtype)
 
         # ── 다음 layer 입력 업데이트 ──────────────────────────────────────
         # R4(U_gu) online: down_proj 앞에 U_gu를 fp32로 적용
