@@ -16,7 +16,7 @@ Rotated GPTQ Core v2
 import math
 import torch
 import torch.nn as nn
-from quantize import quantize, find_params, quantize_nf, find_params_nf, NF2_GRID
+from quantize import quantize, find_params, quantize_nf, find_params_nf, NF2_GRID, get_nf_grid
 
 
 class RotatedGPTQ:
@@ -98,12 +98,13 @@ class RotatedGPTQ:
         scale_all = torch.zeros((self.d_row, n_groups), device=self.dev)
         zero_all  = torch.zeros((self.d_row, n_groups), device=self.dev)
 
-        use_nf2 = (bits == 2)
+        nf_grid = get_nf_grid(bits)   # 2→NF2, 3→NF8, 4→NF16, else None
+        use_nf  = nf_grid is not None
 
         if groupsize <= 0:
             W_rot_full = self._apply_U(W)
-            if use_nf2:
-                scale = find_params_nf(W_rot_full, perchannel=True)
+            if use_nf:
+                scale = find_params_nf(W_rot_full, perchannel=True, nf_grid=nf_grid)
                 zero  = torch.zeros_like(scale)
             else:
                 scale, zero = find_params(W_rot_full, bits, perchannel=True, sym=sym)
@@ -133,8 +134,8 @@ class RotatedGPTQ:
                     g_idx = j_global // groupsize
                     g_end = min(j_global + groupsize, self.d_col)
                     W_rot_g = self._apply_U(W[:, j_global:g_end])
-                    if use_nf2:
-                        scale = find_params_nf(W_rot_g, perchannel=True)
+                    if use_nf:
+                        scale = find_params_nf(W_rot_g, perchannel=True, nf_grid=nf_grid)
                         zero  = torch.zeros_like(scale)
                     else:
                         scale, zero = find_params(W_rot_g, bits, perchannel=True, sym=sym)
@@ -147,8 +148,8 @@ class RotatedGPTQ:
 
                 # ── 핵심: 양자화 시에만 U 회전 ──────────────────────────
                 col_rot = self._apply_U(col.unsqueeze(1)).squeeze(1)  # U @ col
-                if use_nf2:
-                    q_rot = quantize_nf(col_rot.unsqueeze(-1), scale, NF2_GRID).squeeze(-1)
+                if use_nf:
+                    q_rot = quantize_nf(col_rot.unsqueeze(-1), scale, nf_grid).squeeze(-1)
                 else:
                     q_rot = quantize(col_rot.unsqueeze(-1), scale, zero, maxq).squeeze(-1)
                 q       = self._apply_Ut(q_rot.unsqueeze(1)).squeeze(1)  # U^T @ q_rot

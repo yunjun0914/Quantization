@@ -13,8 +13,17 @@ import torch.nn as nn
 # Low-level quantize / dequantize
 # ─────────────────────────────────────────────────────────────────────────────
 
-# NF2 고정 grid (Gaussian quantile 기반, [-1, 1] 정규화)
-NF2_GRID = torch.tensor([-1.0, -0.2767, 0.2767, 1.0], dtype=torch.float32)
+# NF grids (Gaussian quantile 기반, [-1, 1] 정규화)
+NF2_GRID  = torch.tensor([-1.0, -0.2770, 0.2770, 1.0], dtype=torch.float32)
+NF8_GRID  = torch.tensor([-1.0, -0.5783, -0.3186, -0.1025, 0.1025, 0.3186, 0.5783, 1.0], dtype=torch.float32)
+NF16_GRID = torch.tensor([-1.0, -0.7076, -0.5422, -0.4168, -0.3109, -0.2159, -0.1273, -0.0421,
+                            0.0421,  0.1273,  0.2159,  0.3109,  0.4168,  0.5422,  0.7076,  1.0], dtype=torch.float32)
+
+def get_nf_grid(bits: int) -> torch.Tensor:
+    if bits == 2: return NF2_GRID
+    if bits == 3: return NF8_GRID
+    if bits == 4: return NF16_GRID
+    return None
 NF4_GRID = torch.tensor([
     -1.0, -0.6962, -0.5251, -0.3949, -0.2767, -0.1691, -0.0626,
      0.0626,  0.1691,  0.2767,  0.3949,  0.5251,  0.6962,  1.0,
