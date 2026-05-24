@@ -27,7 +27,7 @@ Cholesky trick 수식 근거 (논문 Section 4 / Algorithm 1 notation):
 import math
 import torch
 import torch.nn as nn
-from quantize import Quantizer, quantize, find_params
+from quantize import Quantizer, quantize, find_params, quantize_nf, find_params_nf, NF2_GRID
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -73,7 +73,6 @@ class GPTQ:
         if inp.dim() == 3:
             inp = inp.reshape(-1, inp.shape[-1])   # (n_tokens, d_col)
         inp = inp.float().t()                       # (d_col, n_tokens)
-        
 
         n = inp.shape[1]
         # 온라인 평균: H_new = (n_old * H_old + 2 * inp @ inp^T) / (n_old + n)
@@ -110,6 +109,7 @@ class GPTQ:
         """
         W = self.layer.weight.data.clone().float()   # (d_row, d_col)
         H = self.H.float()                           # (d_col, d_col)
+        use_nf2 = (bits == 2)
 
         # ── dead weight 처리 (활성화 0인 열 = 사용 안 된 feature) ──────────────
         dead = (torch.diag(H) == 0)
@@ -154,8 +154,11 @@ class GPTQ:
         zero_all  = torch.zeros((self.d_row, n_groups), device=self.dev)
 
         if groupsize <= 0:
-            # per-channel: 전체 W 기준으로 scale/zero 한 번 계산
-            scale, zero = find_params(W, bits, perchannel=True, sym=sym)
+            if use_nf2:
+                scale = find_params_nf(W, perchannel=True)
+                zero  = torch.zeros_like(scale)
+            else:
+                scale, zero = find_params(W, bits, perchannel=True, sym=sym)
             scale_all[:, 0] = scale.squeeze(1)
             zero_all[:, 0]  = zero.squeeze(1)
 
@@ -199,23 +202,30 @@ class GPTQ:
                 if groupsize > 0 and j_global % groupsize == 0:
                     g_idx  = j_global // groupsize
                     g_end  = min(j_global + groupsize, self.d_col)
-                    scale, zero = find_params(
-                        W[:, j_global:g_end], bits, perchannel=True, sym=sym
-                    )
+                    if use_nf2:
+                        scale = find_params_nf(W[:, j_global:g_end], perchannel=True)
+                        zero  = torch.zeros_like(scale)
+                    else:
+                        scale, zero = find_params(
+                            W[:, j_global:g_end], bits, perchannel=True, sym=sym
+                        )
                     scale_all[:, g_idx] = scale.squeeze(1)
                     zero_all[:, g_idx]  = zero.squeeze(1)
                 elif groupsize <= 0:
                     g_idx  = 0
-                    scale  = scale_all[:, 0:1]   # (d_row, 1)
+                    scale  = scale_all[:, 0:1]
                     zero   = zero_all[:, 0:1]
 
                 # ── Q[:, j] = quant(W[:, j])  (fake-quantize) ─────────────
-                q = quantize(
-                    col.unsqueeze(-1),    # (d_row, 1)
-                    scale,                # (d_row, 1)
-                    zero,                 # (d_row, 1)
-                    maxq,
-                ).squeeze(-1)            # (d_row,)
+                if use_nf2:
+                    q = quantize_nf(col.unsqueeze(-1), scale, NF2_GRID).squeeze(-1)
+                else:
+                    q = quantize(
+                        col.unsqueeze(-1),
+                        scale,
+                        zero,
+                        maxq,
+                    ).squeeze(-1)
 
                 Q1[:, j_loc]   = q
                 # loss = (w - q)^2 / (2 * H^{-1}_{jj})  = (err)^2 / 2
