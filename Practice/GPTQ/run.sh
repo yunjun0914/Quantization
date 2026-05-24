@@ -23,7 +23,6 @@ python -u main_llama.py \
     --model ~/Quantization/Omni-Quant/OmniQuant/models/llama2-7b \
     --bits 2 \
     --rot hadamard \
-    --groupsize 128 \
     --v2 \
     --compare \
     --percdamp 0.01 \
