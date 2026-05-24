@@ -47,7 +47,6 @@ def llama_rot_sequential_v2(
     bits=4, blocksize=128, percdamp=0.01,
     groupsize=-1, sym=False, actorder=False,
     rot_mode="hadamard", seed=0,
-    use_v=True, use_u=True,
 ):
     print(f"[LLaMA RotatedGPTQ v2] bits={bits}  blocksize={blocksize}  rot={rot_mode}")
     model.eval()
@@ -71,23 +70,14 @@ def llama_rot_sequential_v2(
     print(f"  V({hidden},{hidden})  U_qk({hidden},{hidden})  U_v({hidden},{hidden})")
     print(f"  U_gu({inter},{inter})  U_d({hidden},{hidden})")
 
-    # ablation: use_v=False이면 V=I (identity), use_u=False이면 U=I
-    I_h = torch.eye(hidden, device=device)
-    I_i = torch.eye(inter,  device=device)
-    Vr    = V    if use_v else I_h
-    Uqk   = U_qk if use_u else I_h
-    Uv    = U_v  if use_u else I_h
-    Ugu   = U_gu if use_u else I_i
-    Ud    = U_d  if use_u else I_h
-
     rotations = {
-        "self_attn.q_proj": (Uqk, Vr),
-        "self_attn.k_proj": (Uqk, Vr),
-        "self_attn.v_proj": (Uv,  Vr),
-        "self_attn.o_proj": (Uqk, Vr),
-        "mlp.gate_proj":    (Ugu, Vr),
-        "mlp.up_proj":      (Ugu, Vr),
-        "mlp.down_proj":    (Ud,  Ugu),
+        "self_attn.q_proj": (U_qk, V),
+        "self_attn.k_proj": (U_qk, V),
+        "self_attn.v_proj": (U_v,  V),
+        "self_attn.o_proj": (U_qk, V),
+        "mlp.gate_proj":    (U_gu, V),
+        "mlp.up_proj":      (U_gu, V),
+        "mlp.down_proj":    (U_d,  U_gu),
     }
 
     # ── 입력 캡처 ─────────────────────────────────────────────────────────
@@ -238,7 +228,6 @@ def run_llama_rot_v2(
     nsamples=128, seqlen=2048, seed=0, blocksize=128, percdamp=0.01,
     groupsize=-1, sym=False, actorder=False, rot_mode="hadamard",
     dev="cuda:0", eval_before=True,
-    use_v=True, use_u=True,
 ):
     print(f"Loading model: {model_name}")
     model = LlamaForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16)
@@ -259,7 +248,6 @@ def run_llama_rot_v2(
         bits=bits, blocksize=blocksize, percdamp=percdamp,
         groupsize=groupsize, sym=sym, actorder=actorder,
         rot_mode=rot_mode, seed=seed,
-        use_v=use_v, use_u=use_u,
     )
     print(f"\n[RotatedGPTQ v2] Total time: {time.time()-t0:.1f}s")
 
