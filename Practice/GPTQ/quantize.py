@@ -41,19 +41,41 @@ def quantize_nf(x: torch.Tensor, scale: torch.Tensor, nf_grid: torch.Tensor) -> 
     return x_q * scale                                    # dequantize
 
 
-def find_params_nf(x: torch.Tensor, perchannel: bool = True) -> torch.Tensor:
+def find_params_nf(x: torch.Tensor, perchannel: bool = True, nf_grid: torch.Tensor = None) -> torch.Tensor:
     """
-    NF quantization용 absmax scale 계산.
+    NF quantization용 MSE clipping scale 계산 (QuaRot / AWQ 방식).
+    ratio를 grid search해서 MSE를 최소화하는 scale을 찾음.
     Returns: scale (d_row, 1)
     """
+    if nf_grid is None:
+        nf_grid = NF2_GRID
+
     if perchannel:
         x_flat = x.float().reshape(x.shape[0], -1)
     else:
         x_flat = x.float().flatten().unsqueeze(0)
-    scale = x_flat.abs().max(dim=1, keepdim=True).values.clamp(min=1e-8)
+
+    absmax = x_flat.abs().max(dim=1, keepdim=True).values.clamp(min=1e-8)
+    grid   = nf_grid.to(x_flat.device)
+
+    best_scale = absmax.clone()
+    best_mse   = torch.full((x_flat.shape[0], 1), float('inf'), device=x_flat.device)
+
+    for ratio in [0.75, 0.80, 0.85, 0.90, 0.95, 1.00]:
+        scale_cand = absmax * ratio                          # (d_row, 1)
+        x_norm     = (x_flat / scale_cand).clamp(-1, 1)     # (d_row, d_col)
+        dists      = (x_norm.unsqueeze(-1) - grid.unsqueeze(0).unsqueeze(0)) ** 2
+        idx        = dists.argmin(dim=-1)                    # (d_row, d_col)
+        x_q        = grid[idx] * scale_cand                  # dequantize
+        mse        = (x_flat - x_q).pow(2).mean(dim=1, keepdim=True)  # (d_row, 1)
+
+        better     = mse < best_mse
+        best_scale = torch.where(better, scale_cand, best_scale)
+        best_mse   = torch.where(better, mse, best_mse)
+
     if perchannel:
-        return scale                  # (d_row, 1)
-    return scale.reshape(1, 1)
+        return best_scale             # (d_row, 1)
+    return best_scale.reshape(1, 1)
 
 
 def quantize(x: torch.Tensor, scale: torch.Tensor, zero: torch.Tensor, maxq: int) -> torch.Tensor:
