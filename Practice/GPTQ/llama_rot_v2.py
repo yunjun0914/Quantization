@@ -36,6 +36,44 @@ def get_llama_layers(model):
     return model.model.layers
 
 
+@torch.no_grad()
+def absorb_rmsnorm(model, dtype):
+    """
+    RMSNorm α를 인접 linear layer weight에 흡수.
+    input_layernorm.weight → q/k/v/gate/up weight columns에 흡수
+    post_attention_layernorm.weight → gate/up weight columns에 흡수
+    흡수 후 RMSNorm weight를 1로 초기화.
+    """
+    layers = get_llama_layers(model)
+    for layer in layers:
+        linears = find_linear_layers(layer)
+
+        # input_layernorm α → q/k/v/gate/up columns에 흡수
+        if hasattr(layer, 'input_layernorm'):
+            alpha = layer.input_layernorm.weight.data.float()
+            for name in ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
+                         "mlp.gate_proj", "mlp.up_proj"):
+                if name in linears:
+                    linears[name].weight.data = (
+                        linears[name].weight.data.float() * alpha.unsqueeze(0)
+                    ).to(dtype)
+            layer.input_layernorm.weight.data = torch.ones_like(
+                layer.input_layernorm.weight.data)
+
+        # post_attention_layernorm α → gate/up columns에 흡수
+        if hasattr(layer, 'post_attention_layernorm'):
+            alpha = layer.post_attention_layernorm.weight.data.float()
+            for name in ("mlp.gate_proj", "mlp.up_proj"):
+                if name in linears:
+                    linears[name].weight.data = (
+                        linears[name].weight.data.float() * alpha.unsqueeze(0)
+                    ).to(dtype)
+            layer.post_attention_layernorm.weight.data = torch.ones_like(
+                layer.post_attention_layernorm.weight.data)
+
+    print("[absorb_rmsnorm] RMSNorm α absorbed into weight matrices")
+
+
 def find_linear_layers(layer):
     return {name: m for name, m in layer.named_modules() if isinstance(m, nn.Linear)}
 
@@ -233,6 +271,11 @@ def run_llama_rot_v2(
 
     trainloader, _ = get_loaders(dataset, nsamples=nsamples, seed=seed, seqlen=seqlen, model=model_name)
     _, testenc     = get_loaders("wikitext2", nsamples=nsamples, seed=seed, seqlen=seqlen, model=model_name)
+
+    dtype = next(iter(model.parameters())).dtype
+
+    # RMSNorm α 흡수 (rotation 전에 수행)
+    absorb_rmsnorm(model, dtype)
 
     ppl_fp16 = None
     if eval_before:
