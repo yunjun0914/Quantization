@@ -144,11 +144,8 @@ def llama_rot_sequential_v2(
         for name, lin in linears.items():
             if name not in rotations: continue
             _, Vr = rotations[name]
-            if name == "mlp.down_proj":
-                # down_proj: W_stored는 Q(W @ U_gu^T), W_orig도 U_gu^T 공간
-                W_orig_dict[name] = (lin.weight.data.float() @ Vr.float()).cpu()
-            else:
-                W_orig_dict[name] = (lin.weight.data.float() @ Vr.float()).cpu()
+            # fp32로 계산 (fp16 precision loss 방지)
+            W_orig_dict[name] = (lin.weight.data.float() @ Vr.float().t()).cpu()  # V^T 공간으로 저장
 
         # ── Step 2: W @ V^T ───────────────────────────────────────────────
         for name, lin in linears.items():
@@ -212,9 +209,15 @@ def llama_rot_sequential_v2(
                 # 보정: W_stored_vspace에 더한 뒤 다시 원래 공간으로
                 R_approx = U_r @ torch.diag(S_r) @ Vt_r
                 if name == "mlp.down_proj":
+                    # W_stored = Q(W @ U_gu^T): U_gu^T 공간
+                    # inference: W_stored @ (U_gu @ swiglu) ≈ W @ swiglu
+                    # SVD 보정: R은 U_gu^T 공간 → W_stored에 직접 더하면 됨
+                    # R_approx @ U_gu @ swiglu가 되므로 올바른 보정
                     lin.weight.data = (W_stored + R_approx).to(dtype)
                 else:
-                    # V^T 공간 보정 → 원래 공간으로: R_approx @ V
+                    # W_stored = U^T @ Q(U @ WV^T) @ V: 원래 공간
+                    # W_stored_vspace = W_stored @ V^T: V^T 공간
+                    # R_approx도 V^T 공간 → 원래 공간으로: R_approx @ V
                     lin.weight.data = (W_stored + R_approx @ Vr.float()).to(dtype)
 
         # ── 다음 layer 입력 업데이트 ──────────────────────────────────────
