@@ -109,10 +109,12 @@ def llama_rot_sequential_v2(
         layer = layer.to(device)
         linears = find_linear_layers(layer)
 
-        # ── Step 1: Hessian 수집 ──────────────────────────────────────────
+        # ── Step 1a: q/k/v/o/gate/down Hessian 수집 (up 제외) ───────────
+        # up_proj는 SwiGLU joint를 위해 별도 처리
+        phase1_names = [n for n in rotations if n != "mlp.up_proj"]
         handlers = {
             name: RotatedGPTQ(lin, *rotations[name])
-            for name, lin in linears.items() if name in rotations
+            for name, lin in linears.items() if name in phase1_names
         }
 
         hooks = []
@@ -130,6 +132,59 @@ def llama_rot_sequential_v2(
             layer(inps[i].unsqueeze(0).to(device), **kw)
         for h in hooks: h.remove()
 
+        # ── Step 1b: gate_proj 양자화 (up Hessian 수집 전) ───────────────
+        # gate를 먼저 양자화하고, 양자화된 gate의 SiLU 출력으로 up Hessian 수집
+        W2_gate = linears["mlp.gate_proj"].weight.data.clone()  # 원래 gate weight 저장
+
+        _, Vr_gate = rotations["mlp.gate_proj"]
+        linears["mlp.gate_proj"].weight.data = (W2_gate.float() @ Vr_gate.t()).to(dtype)
+
+        Q_gate, scale_gate, zero_gate, loss_gate = handlers["mlp.gate_proj"].quantize(
+            bits=bits, blocksize=blocksize, percdamp=percdamp,
+            groupsize=groupsize, sym=sym, actorder=actorder,
+        )
+        # gate weight를 양자화된 상태로 임시 적용
+        gate_stored = (Q_gate.float() @ Vr_gate.float()).to(dtype)
+        linears["mlp.gate_proj"].weight.data = gate_stored
+        handlers["mlp.gate_proj"].free()
+
+        print(f"  [SwiGLU joint] gate pre-quantized, loss={loss_gate.mean():.6f}")
+
+        # ── Step 1c: up_proj Hessian 수집 (SiLU(gate_q) * X 기준) ────────
+        up_handler = RotatedGPTQ(linears["mlp.up_proj"], *rotations["mlp.up_proj"])
+
+        # SiLU(gate_q) output을 up input에 곱해서 Hessian 수집
+        # hook: up_proj input X → SiLU(gate_q(x)) * X
+        gate_acts = []  # gate_q activation 캐시
+
+        def gate_hook(m, inp, out):
+            # gate_q output에 SiLU 적용
+            gate_acts.append(torch.nn.functional.silu(out.detach()))
+
+        def up_hook_swiglu(m, inp, out):
+            # inp[0]: up_proj input X
+            # gate_acts에서 SiLU(gate_q) 꺼내서 곱함
+            if gate_acts:
+                silu_gate = gate_acts.pop(0)
+                # weighted input: SiLU(gate_q) * X
+                weighted_inp = silu_gate * inp[0]
+                up_handler.add_batch(weighted_inp.data, out.data)
+
+        h_gate = linears["mlp.gate_proj"].register_forward_hook(gate_hook)
+        h_up   = linears["mlp.up_proj"].register_forward_hook(up_hook_swiglu)
+
+        for i in range(nsamples):
+            kw = {}
+            if cache["position_ids"] is not None:
+                kw["position_ids"] = cache["position_ids"].to(device)
+            layer(inps[i].unsqueeze(0).to(device), **kw)
+
+        h_gate.remove(); h_up.remove()
+        handlers["mlp.up_proj"] = up_handler
+
+        # gate weight 원복 (Step 2에서 다시 V^T 적용할 것이므로)
+        linears["mlp.gate_proj"].weight.data = W2_gate
+
         # ── H diag stats (layer 0) ────────────────────────────────────────
         if layer_idx == 0:
             print("  [H diag stats]")
@@ -145,8 +200,15 @@ def llama_rot_sequential_v2(
             lin.weight.data = (lin.weight.data.float() @ Vr.t()).to(dtype)
 
         # ── Step 3: GPTQ 실행 ─────────────────────────────────────────────
-        Q_dict = {}
+        # gate_proj는 Step 1b에서 이미 양자화됨
+        Q_dict = {"mlp.gate_proj": Q_gate}
+        results[f"layer{layer_idx}.mlp.gate_proj"] = {
+            "Q": Q_gate.cpu(), "scale": scale_gate.cpu(),
+            "zero": zero_gate.cpu(), "loss": loss_gate.mean().item(),
+        }
+
         for name, handler in handlers.items():
+            if name == "mlp.gate_proj": continue  # 이미 양자화됨
             print(f"  quantizing {name:30s} ... ", end="", flush=True)
             Q, scale, zero, loss = handler.quantize(
                 bits=bits, blocksize=blocksize, percdamp=percdamp,
