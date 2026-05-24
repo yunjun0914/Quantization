@@ -29,7 +29,7 @@ class RotatedGPTQ:
         W = layer.weight.data
         self.d_row, self.d_col = W.shape
 
-        self.U = U.to(self.dev).float()
+        self.U = U.to(self.dev).float() if U is not None else None if U is not None else None
         self.V = V.to(self.dev).float()
 
         self.H        = torch.zeros((self.d_col, self.d_col), device=self.dev)
@@ -167,16 +167,20 @@ class RotatedGPTQ:
         return Q, scale_all, zero_all, Losses
 
     def _apply_U(self, x: torch.Tensor) -> torch.Tensor:
-        """U @ x. U가 vector(±1)면 elementwise, matrix면 matmul."""
+        """U @ x. U=None이면 identity."""
+        if self.U is None:
+            return x
         if self.U.dim() == 1:
-            return self.U.unsqueeze(1) * x   # diag(U) @ x
+            return self.U.unsqueeze(1) * x
         else:
-            return self.U @ x               # full matrix
+            return self.U @ x
 
     def _apply_Ut(self, x: torch.Tensor) -> torch.Tensor:
-        """U^T @ x."""
+        """U^T @ x. U=None이면 identity."""
+        if self.U is None:
+            return x
         if self.U.dim() == 1:
-            return self.U.unsqueeze(1) * x   # U^T = U for ±1
+            return self.U.unsqueeze(1) * x
         else:
             return self.U.t() @ x
 
