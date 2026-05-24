@@ -24,7 +24,7 @@ python -u main_llama.py \
     --bits 2 \
     --rot hadamard \
     --no_u \
-    --groupsize 128
+    --groupsize 128 \
     --v2 \
     --compare \
     --percdamp 0.01 \
