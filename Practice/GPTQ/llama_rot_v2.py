@@ -39,20 +39,24 @@ def get_llama_layers(model):
 @torch.no_grad()
 def absorb_rmsnorm(model, dtype):
     """
-    RMSNorm α를 인접 linear layer weight에 흡수.
-    input_layernorm.weight → q/k/v/gate/up weight columns에 흡수
-    post_attention_layernorm.weight → gate/up weight columns에 흡수
-    흡수 후 RMSNorm weight를 1로 초기화.
+    RMSNorm α를 인접 input-side weight에 흡수 (QuaRot 논문 Stage 1a).
+
+    LLaMA 구조:
+      input_layernorm(α1) → q/k/v_proj (input-side)
+      post_attention_layernorm(α2) → gate/up_proj (input-side)
+      o_proj, down_proj는 output-side → 흡수 안 함
+
+    W_new = W @ diag(α)  (column-wise 곱)
+    RMSNorm weight → 1로 초기화 (순수 normalize만 남김)
     """
     layers = get_llama_layers(model)
     for layer in layers:
         linears = find_linear_layers(layer)
 
-        # input_layernorm α → q/k/v/gate/up columns에 흡수
+        # input_layernorm α1 → q/k/v_proj columns에만 흡수
         if hasattr(layer, 'input_layernorm'):
             alpha = layer.input_layernorm.weight.data.float()
-            for name in ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
-                         "mlp.gate_proj", "mlp.up_proj"):
+            for name in ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"):
                 if name in linears:
                     linears[name].weight.data = (
                         linears[name].weight.data.float() * alpha.unsqueeze(0)
@@ -60,7 +64,7 @@ def absorb_rmsnorm(model, dtype):
             layer.input_layernorm.weight.data = torch.ones_like(
                 layer.input_layernorm.weight.data)
 
-        # post_attention_layernorm α → gate/up columns에 흡수
+        # post_attention_layernorm α2 → gate/up_proj columns에만 흡수
         if hasattr(layer, 'post_attention_layernorm'):
             alpha = layer.post_attention_layernorm.weight.data.float()
             for name in ("mlp.gate_proj", "mlp.up_proj"):
@@ -71,7 +75,7 @@ def absorb_rmsnorm(model, dtype):
             layer.post_attention_layernorm.weight.data = torch.ones_like(
                 layer.post_attention_layernorm.weight.data)
 
-    print("[absorb_rmsnorm] RMSNorm α absorbed into weight matrices")
+    print("[absorb_rmsnorm] RMSNorm α absorbed into q/k/v and gate/up weights")
 
 
 def find_linear_layers(layer):
@@ -274,15 +278,16 @@ def run_llama_rot_v2(
 
     dtype = next(iter(model.parameters())).dtype
 
-    # RMSNorm α 흡수 (rotation 전에 수행)
-    absorb_rmsnorm(model, dtype)
-
+    # FP16 baseline: absorb 이전에 평가 (원래 모델 기준)
     ppl_fp16 = None
     if eval_before:
         model = model.to(dev)
         ppl_fp16 = eval_ppl(model, testenc, dev, seqlen)
         print(f"\n[FP16 baseline] PPL = {ppl_fp16:.2f}")
         model = model.cpu()
+
+    # RMSNorm α 흡수 (FP16 eval 이후, rotation 전에 수행)
+    absorb_rmsnorm(model, dtype)
 
     t0      = time.time()
     results, U_gu = llama_rot_sequential_v2(
