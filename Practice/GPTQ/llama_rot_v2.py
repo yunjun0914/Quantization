@@ -36,47 +36,6 @@ def get_llama_layers(model):
     return model.model.layers
 
 
-@torch.no_grad()
-def absorb_rmsnorm(model, dtype):
-    """
-    RMSNorm α를 인접 input-side weight에 흡수 (QuaRot 논문 Stage 1a).
-
-    LLaMA 구조:
-      input_layernorm(α1) → q/k/v_proj (input-side)
-      post_attention_layernorm(α2) → gate/up_proj (input-side)
-      o_proj, down_proj는 output-side → 흡수 안 함
-
-    W_new = W @ diag(α)  (column-wise 곱)
-    RMSNorm weight → 1로 초기화 (순수 normalize만 남김)
-    """
-    layers = get_llama_layers(model)
-    for layer in layers:
-        linears = find_linear_layers(layer)
-
-        # input_layernorm α1 → q/k/v_proj columns에만 흡수
-        if hasattr(layer, 'input_layernorm'):
-            alpha = layer.input_layernorm.weight.data.float()
-            for name in ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"):
-                if name in linears:
-                    linears[name].weight.data = (
-                        linears[name].weight.data.float() * alpha.unsqueeze(0)
-                    ).to(dtype)
-            layer.input_layernorm.weight.data = torch.ones_like(
-                layer.input_layernorm.weight.data)
-
-        # post_attention_layernorm α2 → gate/up_proj columns에만 흡수
-        if hasattr(layer, 'post_attention_layernorm'):
-            alpha = layer.post_attention_layernorm.weight.data.float()
-            for name in ("mlp.gate_proj", "mlp.up_proj"):
-                if name in linears:
-                    linears[name].weight.data = (
-                        linears[name].weight.data.float() * alpha.unsqueeze(0)
-                    ).to(dtype)
-            layer.post_attention_layernorm.weight.data = torch.ones_like(
-                layer.post_attention_layernorm.weight.data)
-
-    print("[absorb_rmsnorm] RMSNorm α absorbed into q/k/v and gate/up weights")
-
 
 def find_linear_layers(layer):
     return {name: m for name, m in layer.named_modules() if isinstance(m, nn.Linear)}
@@ -88,6 +47,7 @@ def llama_rot_sequential_v2(
     bits=4, blocksize=128, percdamp=0.01,
     groupsize=-1, sym=False, actorder=False,
     rot_mode="hadamard", seed=0,
+    use_v=True, use_u=True,
 ):
     print(f"[LLaMA RotatedGPTQ v2] bits={bits}  blocksize={blocksize}  rot={rot_mode}")
     model.eval()
@@ -111,14 +71,23 @@ def llama_rot_sequential_v2(
     print(f"  V({hidden},{hidden})  U_qk({hidden},{hidden})  U_v({hidden},{hidden})")
     print(f"  U_gu({inter},{inter})  U_d({hidden},{hidden})")
 
+    # ablation: use_v=False이면 V=I (identity), use_u=False이면 U=I
+    I_h = torch.eye(hidden, device=device)
+    I_i = torch.eye(inter,  device=device)
+    Vr    = V    if use_v else I_h
+    Uqk   = U_qk if use_u else I_h
+    Uv    = U_v  if use_u else I_h
+    Ugu   = U_gu if use_u else I_i
+    Ud    = U_d  if use_u else I_h
+
     rotations = {
-        "self_attn.q_proj": (U_qk, V),
-        "self_attn.k_proj": (U_qk, V),
-        "self_attn.v_proj": (U_v,  V),
-        "self_attn.o_proj": (U_qk, V),
-        "mlp.gate_proj":    (U_gu, V),
-        "mlp.up_proj":      (U_gu, V),
-        "mlp.down_proj":    (U_d,  U_gu),
+        "self_attn.q_proj": (Uqk, Vr),
+        "self_attn.k_proj": (Uqk, Vr),
+        "self_attn.v_proj": (Uv,  Vr),
+        "self_attn.o_proj": (Uqk, Vr),
+        "mlp.gate_proj":    (Ugu, Vr),
+        "mlp.up_proj":      (Ugu, Vr),
+        "mlp.down_proj":    (Ud,  Ugu),
     }
 
     # ── 입력 캡처 ─────────────────────────────────────────────────────────
@@ -269,6 +238,7 @@ def run_llama_rot_v2(
     nsamples=128, seqlen=2048, seed=0, blocksize=128, percdamp=0.01,
     groupsize=-1, sym=False, actorder=False, rot_mode="hadamard",
     dev="cuda:0", eval_before=True,
+    use_v=True, use_u=True,
 ):
     print(f"Loading model: {model_name}")
     model = LlamaForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16)
@@ -276,9 +246,6 @@ def run_llama_rot_v2(
     trainloader, _ = get_loaders(dataset, nsamples=nsamples, seed=seed, seqlen=seqlen, model=model_name)
     _, testenc     = get_loaders("wikitext2", nsamples=nsamples, seed=seed, seqlen=seqlen, model=model_name)
 
-    dtype = next(iter(model.parameters())).dtype
-
-    # FP16 baseline: absorb 이전에 평가 (원래 모델 기준)
     ppl_fp16 = None
     if eval_before:
         model = model.to(dev)
@@ -286,15 +253,13 @@ def run_llama_rot_v2(
         print(f"\n[FP16 baseline] PPL = {ppl_fp16:.2f}")
         model = model.cpu()
 
-    # RMSNorm α 흡수 (FP16 eval 이후, rotation 전에 수행)
-    absorb_rmsnorm(model, dtype)
-
     t0      = time.time()
     results, U_gu = llama_rot_sequential_v2(
         model, trainloader, dev,
         bits=bits, blocksize=blocksize, percdamp=percdamp,
         groupsize=groupsize, sym=sym, actorder=actorder,
         rot_mode=rot_mode, seed=seed,
+        use_v=use_v, use_u=use_u,
     )
     print(f"\n[RotatedGPTQ v2] Total time: {time.time()-t0:.1f}s")
 

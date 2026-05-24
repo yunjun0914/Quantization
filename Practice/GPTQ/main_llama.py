@@ -32,6 +32,8 @@ def parse_args():
     p.add_argument("--actorder",  action="store_true")
     p.add_argument("--rot",       type=str,   default="hadamard", choices=["random","hadamard"])
     p.add_argument("--v2",        action="store_true", help="RotatedGPTQ v2 (globally shared V & U)")
+    p.add_argument("--no_v",      action="store_true", help="ablation: V rotation 제거 (V=identity)")
+    p.add_argument("--no_u",      action="store_true", help="ablation: U rotation 제거 (U=identity)")
     p.add_argument("--dev",       type=str,   default="cuda:0")
     p.add_argument("--compare",   action="store_true", help="기존 GPTQ와 PPL 비교")
     return p.parse_args()
@@ -64,6 +66,8 @@ if __name__ == "__main__":
             rot_mode    = args.rot,
             dev         = args.dev,
             eval_before = True,
+            use_v       = not args.no_v,
+            use_u       = not args.no_u,
         )
 
         if args.compare:
@@ -108,6 +112,8 @@ if __name__ == "__main__":
             actorder    = args.actorder,
             dev         = args.dev,
             eval_before = True,
+            use_v       = not args.no_v,
+            use_u       = not args.no_u,
         )
         print("\n" + "=" * 60)
         print(f"  FP16 baseline : {out['ppl_fp16']:.2f}")
