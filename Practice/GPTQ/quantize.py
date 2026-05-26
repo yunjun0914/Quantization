@@ -94,6 +94,63 @@ def find_scale_2d(x: torch.Tensor, codebook: torch.Tensor = None) -> torch.Tenso
 
     return best_scale  # (d_row//2, 1)
 
+def e8_nearest(x: torch.Tensor) -> torch.Tensor:
+    """
+    E8 lattice nearest neighbor.
+    E8 = D8 ∪ (D8 + [0.5,...,0.5])
+    D8: 합이 짝수인 정수 벡터
+    x: (..., 8)
+    """
+    z1 = torch.round(x)
+    z2 = torch.round(x - 0.5) + 0.5
+
+    def project_D8(z, x_ref):
+        s = z.long().sum(dim=-1, keepdim=True) % 2
+        err = (z - x_ref).abs()
+        idx = err.argmax(dim=-1, keepdim=True)
+        sign = torch.where(
+            z.gather(-1, idx) > x_ref.gather(-1, idx),
+            torch.tensor(-1.0, device=z.device),
+            torch.tensor(1.0, device=z.device)
+        )
+        delta = torch.zeros_like(z)
+        delta.scatter_(-1, idx, sign)
+        return z + delta * s.float()
+
+    z1_d8 = project_D8(z1, x)
+    z2_d8 = project_D8(z2, x)
+    dist1 = (x - z1_d8).pow(2).sum(dim=-1, keepdim=True)
+    dist2 = (x - z2_d8).pow(2).sum(dim=-1, keepdim=True)
+    return torch.where(dist1 <= dist2, z1_d8, z2_d8)
+
+
+def quantize_e8(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """
+    E8 lattice quantization.
+    x:     (d_row, 1) - 하나의 column
+    scale: (d_row//8, 1) - 8개 row block마다 shared scale
+    Returns: (d_row, 1) quantized
+    """
+    x_blocks = x.reshape(-1, 8).float()           # (d_row//8, 8)
+    x_norm   = x_blocks / scale.clamp(min=1e-8)   # scale로 정규화
+    x_q      = e8_nearest(x_norm)                 # E8 nearest
+    return (x_q * scale).reshape(-1, 1)
+
+
+def find_scale_e8(W: torch.Tensor) -> torch.Tensor:
+    """
+    E8 VQ용 scale 계산.
+    W: (d_row, d_col) UWV^T 공간
+    Returns: scale (d_row//8, 1)
+    optimal scale: std * 0.3 (Gaussian에서 E8 MSE 최소화)
+    """
+    d_row, d_col = W.shape
+    x_blocks = W.float().reshape(-1, 8, d_col)    # (d_row//8, 8, d_col)
+    x_flat   = x_blocks.reshape(x_blocks.shape[0], -1)
+    std      = x_flat.std(dim=1, keepdim=True).clamp(min=1e-8)
+    return std * 0.3   # E8 optimal scale for Gaussian
+
+
 def get_nf_grid(bits: int) -> torch.Tensor:
     if bits == 2: return NF2_GRID
     if bits == 3: return NF8_GRID

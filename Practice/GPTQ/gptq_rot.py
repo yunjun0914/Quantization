@@ -16,12 +16,12 @@ Rotated GPTQ Core v2
 import math
 import torch
 import torch.nn as nn
-from quantize import quantize, find_params, quantize_nf, find_params_nf, NF2_GRID, get_nf_grid, quantize_2d_vq, find_scale_2d, get_codebook_2d
+from quantize import quantize, find_params, quantize_nf, find_params_nf, NF2_GRID, get_nf_grid, quantize_2d_vq, find_scale_2d, get_codebook_2d, quantize_e8, find_scale_e8
 
 
 class RotatedGPTQ:
 
-    def __init__(self, layer: nn.Linear, U: torch.Tensor, V: torch.Tensor, restore_u: bool = True, use_2d_vq: bool = False):
+    def __init__(self, layer: nn.Linear, U: torch.Tensor, V: torch.Tensor, restore_u: bool = True, use_2d_vq: bool = False, use_e8: bool = False):
         self.layer = layer
         self.dev   = layer.weight.device
         self.dtype = layer.weight.dtype
@@ -31,7 +31,8 @@ class RotatedGPTQ:
 
         self.U = U.to(self.dev).float() if U is not None else None
         self.restore_u = restore_u
-        self.use_2d_vq  = use_2d_vq if U is not None else None
+        self.use_2d_vq  = use_2d_vq
+        self.use_e8     = use_e8 if U is not None else None
         self.V = V.to(self.dev).float()
 
         self.H        = torch.zeros((self.d_col, self.d_col), device=self.dev)
@@ -103,12 +104,18 @@ class RotatedGPTQ:
         nf_grid  = get_nf_grid(bits)   # 2→NF2, 3→NF8, 4→NF16, else None
         use_nf   = nf_grid is not None
         use_2dvq = self.use_2d_vq and (bits == 2) and (self.d_row % 2 == 0)
+        use_e8vq = self.use_e8    and (bits == 2) and (self.d_row % 8 == 0)
 
         # 2D VQ: per-pair scale 미리 계산
         if use_2dvq:
             codebook_2d = get_codebook_2d(self.dev)
-            W_rot_all   = self._apply_U(W)   # (d_row, d_col)
+            W_rot_all   = self._apply_U(W)
             scale_2d    = find_scale_2d(W_rot_all)  # (d_row//2, 1)
+
+        # E8 VQ: per-8block scale 미리 계산
+        if use_e8vq:
+            W_rot_all = self._apply_U(W)
+            scale_e8  = find_scale_e8(W_rot_all)    # (d_row//8, 1)
 
         if groupsize <= 0:
             W_rot_full = self._apply_U(W)
@@ -158,7 +165,10 @@ class RotatedGPTQ:
                 # ── 핵심: 양자화 시에만 U 회전 ──────────────────────────
                 col_rot = self._apply_U(col.unsqueeze(1))  # (d_row, 1)
 
-                if use_2dvq:
+                if use_e8vq:
+                    # E8 lattice quantization (8D cross-row)
+                    q_rot = quantize_e8(col_rot, scale_e8)  # (d_row, 1)
+                elif use_2dvq:
                     # 2D cross-row vector quantization
                     q_rot = quantize_2d_vq(col_rot, scale_2d, codebook_2d)  # (d_row, 1)
                 elif use_nf:
