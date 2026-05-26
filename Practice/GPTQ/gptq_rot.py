@@ -170,16 +170,17 @@ class RotatedGPTQ:
 
                 if use_e8vq:
                     # E8P column-wise (QuIP# Block LDLQ 방식)
+                    # W1 (오차 전파된 현재 W)에서 8개 column 묶음
                     if j_global % 8 == 0:
-                        j_end  = min(j_global + 8, self.d_col)
-                        actual = j_end - j_global
-                        W_blk  = W[:, j_global:j_end]
-                        W_rot_blk = self._apply_U(W_blk)
+                        loc_end = min(j_loc + 8, count)
+                        actual  = loc_end - j_loc
+                        W1_blk  = W1[:, j_loc:loc_end]        # W1에서 가져옴 ✅
+                        W_rot_blk = self._apply_U(W1_blk)
                         if actual < 8:
-                            pad = torch.zeros(self.d_row, 8-actual, device=W.device)
+                            pad = torch.zeros(self.d_row, 8-actual, device=W1.device)
                             W_rot_blk = torch.cat([W_rot_blk, pad], dim=1)
                         _e8p_block_cache = quantize_e8_colwise(
-                            W_rot_blk, scale_e8_col)  # (d_row, 8)
+                            W_rot_blk, scale_e8_col)            # (d_row, 8)
                     col_in_block = j_global % 8
                     q_rot = self._apply_Ut(
                         _e8p_block_cache[:, col_in_block:col_in_block+1])
