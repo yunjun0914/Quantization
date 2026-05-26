@@ -16,7 +16,7 @@ Rotated GPTQ Core v2
 import math
 import torch
 import torch.nn as nn
-from quantize import quantize, find_params, quantize_nf, find_params_nf, NF2_GRID, get_nf_grid, quantize_2d_vq, find_scale_2d, get_codebook_2d, quantize_e8, find_scale_e8
+from quantize import quantize, find_params, quantize_nf, find_params_nf, NF2_GRID, get_nf_grid, quantize_2d_vq, find_scale_2d, get_codebook_2d, quantize_e8, find_scale_e8, get_e8p_codebook, _quantize_e8_batch
 
 
 class RotatedGPTQ:
@@ -32,7 +32,7 @@ class RotatedGPTQ:
         self.U = U.to(self.dev).float() if U is not None else None
         self.restore_u = restore_u
         self.use_2d_vq  = use_2d_vq
-        self.use_e8     = use_e8 if U is not None else None
+        self.use_e8     = use_e8  # U=None이어도 E8 적용 가능
         self.V = V.to(self.dev).float()
 
         self.H        = torch.zeros((self.d_col, self.d_col), device=self.dev)
@@ -141,6 +141,8 @@ class RotatedGPTQ:
             Loss1 = torch.zeros_like(W1)
             Hinv1 = Hinv[i1:i2, i1:i2]
 
+
+
             for j_loc in range(count):
                 j_global = i1 + j_loc
                 col      = W1[:, j_loc]    # W 공간 column (d_row,)
@@ -166,7 +168,7 @@ class RotatedGPTQ:
                 col_rot = self._apply_U(col.unsqueeze(1))  # (d_row, 1)
 
                 if use_e8vq:
-                    # E8 lattice quantization (8D cross-row)
+                    # E8P: 현재 시점의 col_rot으로 nearest 계산
                     q_rot = quantize_e8(col_rot, scale_e8)  # (d_row, 1)
                 elif use_2dvq:
                     # 2D cross-row vector quantization
