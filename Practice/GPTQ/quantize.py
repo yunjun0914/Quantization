@@ -20,19 +20,17 @@ NF16_GRID = torch.tensor([-1.0, -0.7076, -0.5422, -0.4168, -0.3109, -0.2159, -0.
                             0.0421,  0.1273,  0.2159,  0.3109,  0.4168,  0.5422,  0.7076,  1.0], dtype=torch.float32)
 
 # 2D cross-row Vector Quantization codebook (Gaussian-optimal, 16 centers = 2bit/weight)
-CODEBOOK_2D = None  # 처음 호출 시 생성
+# 미리 계산된 codebook (모듈 로드 시 한 번만)
+_CODEBOOK_2D_DATA = torch.tensor([
+    [ 1.8768, -0.2440], [ 0.0240, -0.0116], [ 1.7147,  1.0772], [-0.7371, -0.4963],
+    [ 1.2226, -1.4278], [-1.8262, -0.3406], [-1.1431, -1.4695], [ 0.5959,  1.7583],
+    [ 0.0635, -0.9517], [ 0.8230, -0.4106], [ 0.8337,  0.5137], [-0.0190,  0.8710],
+    [-0.7123,  1.6927], [-0.8336,  0.4270], [ 0.0342, -1.9977], [-1.7693,  0.9513],
+], dtype=torch.float32)
 
 def get_codebook_2d(device='cpu') -> torch.Tensor:
-    """Gaussian-optimal 2D codebook (16 centers, 2bit/weight)"""
-    global CODEBOOK_2D
-    if CODEBOOK_2D is None:
-        import numpy as np
-        np.random.seed(42)
-        from scipy.cluster.vq import kmeans
-        samples = np.random.randn(200000, 2).astype(np.float32)
-        cb, _ = kmeans(samples, 16, iter=200)
-        CODEBOOK_2D = torch.tensor(cb, dtype=torch.float32)
-    return CODEBOOK_2D.to(device)
+    """Gaussian-optimal 2D codebook (16 centers, 2bit/weight) - 미리 계산됨"""
+    return _CODEBOOK_2D_DATA.to(device)
 
 
 def quantize_2d_vq(x: torch.Tensor, scale: torch.Tensor, codebook: torch.Tensor) -> torch.Tensor:
@@ -59,16 +57,46 @@ def quantize_2d_vq(x: torch.Tensor, scale: torch.Tensor, codebook: torch.Tensor)
     return x_q.reshape(-1, 1)                   # (d_row, 1)
 
 
-def find_scale_2d(x: torch.Tensor) -> torch.Tensor:
+def find_scale_2d(x: torch.Tensor, codebook: torch.Tensor = None) -> torch.Tensor:
     """
-    2D VQ용 scale 계산 (pair별 MSE clipping).
-    x: (d_row, d_col) WV^T 공간
+    2D VQ용 MSE clipping scale 계산.
+    x: (d_row, d_col) UWV^T 공간
     Returns: scale (d_row//2, 1)
     """
-    x_pairs = x.float().reshape(-1, 2, x.shape[1])  # (d_row//2, 2, d_col)
-    # pair별 std
-    std = x_pairs.reshape(x_pairs.shape[0], -1).std(dim=1, keepdim=True).clamp(min=1e-8)
-    return std  # (d_row//2, 1)
+    if codebook is None:
+        codebook = get_codebook_2d(x.device)
+
+    x_pairs = x.float().reshape(-1, 2, x.shape[1])        # (d_row//2, 2, d_col)
+    x_flat  = x_pairs.reshape(x_pairs.shape[0], -1)        # (d_row//2, 2*d_col)
+    std     = x_flat.std(dim=1, keepdim=True).clamp(min=1e-8)
+
+    best_scale = std * 2.0
+    best_mse   = torch.full((x_flat.shape[0], 1), float('inf'), device=x.device)
+    cb         = codebook.to(x.device)
+
+    # 메모리 절약: pair별로 독립 계산 (d_col 방향 loop 제거)
+    # x_flat: (d_row//2, 2*d_col) → pair별 MSE search
+    for k in [1.8, 2.0, 2.2, 2.5, 3.0]:
+        scale_cand = std * k                                    # (d_row//2, 1)
+        # x_flat을 (d_row//2, d_col, 2)로 reshape
+        x_2d   = x_flat.reshape(x_flat.shape[0], -1, 2)        # (d_row//2, d_col, 2)
+        x_norm = (x_2d / scale_cand.unsqueeze(1)).clamp(-3, 3) # (d_row//2, d_col, 2)
+        # chunk 단위로 처리해서 메모리 절약
+        chunk  = 512
+        mse_sum = torch.zeros(x_flat.shape[0], device=x.device)
+        for c in range(0, x_2d.shape[1], chunk):
+            xc    = x_norm[:, c:c+chunk, :]                     # (d_row//2, chunk, 2)
+            dists = (xc.unsqueeze(-2) - cb.unsqueeze(0).unsqueeze(0)).pow(2).sum(-1)
+            idx   = dists.argmin(dim=-1)                         # (d_row//2, chunk)
+            xc_q  = cb[idx] * scale_cand.unsqueeze(1)           # (d_row//2, chunk, 2)
+            mse_sum += (x_2d[:, c:c+chunk, :] - xc_q).pow(2).sum(dim=(1,2))
+        mse = (mse_sum / (x_2d.shape[1] * 2)).unsqueeze(1)
+
+        better     = mse < best_mse
+        best_scale = torch.where(better, scale_cand, best_scale)
+        best_mse   = torch.where(better, mse, best_mse)
+
+    return best_scale  # (d_row//2, 1)
 
 
 def get_nf_grid(bits: int) -> torch.Tensor:
@@ -116,14 +144,14 @@ def find_params_nf(x: torch.Tensor, perchannel: bool = True, nf_grid: torch.Tens
     else:
         x_flat = x.float().flatten().unsqueeze(0)
 
-    absmax = x_flat.abs().max(dim=1, keepdim=True).values.clamp(min=1e-8)
+    std    = x_flat.std(dim=1, keepdim=True).clamp(min=1e-8)
     grid   = nf_grid.to(x_flat.device)
 
-    best_scale = absmax.clone()
+    best_scale = std * 2.0
     best_mse   = torch.full((x_flat.shape[0], 1), float('inf'), device=x_flat.device)
 
-    for ratio in [0.75, 0.80, 0.85, 0.90, 0.95, 1.00]:
-        scale_cand = absmax * ratio                          # (d_row, 1)
+    for ratio in [1.5, 1.8, 2.0, 2.2, 2.5, 2.8, 3.0]:
+        scale_cand = std * ratio                             # (d_row, 1)
         x_norm     = (x_flat / scale_cand).clamp(-1, 1)     # (d_row, d_col)
         dists      = (x_norm.unsqueeze(-1) - grid.unsqueeze(0).unsqueeze(0)) ** 2
         idx        = dists.argmin(dim=-1)                    # (d_row, d_col)
