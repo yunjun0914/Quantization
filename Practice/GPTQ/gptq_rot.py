@@ -195,7 +195,7 @@ class RotatedGPTQ:
                 col_rot = col_rot.squeeze(1)
 
                 if use_e8vq:
-                    q = q_rot.squeeze(1)  # E8P colwise: _apply_Ut 이미 적용
+                    q = q_rot.squeeze(-1) if q_rot.dim() > 1 else q_rot
                 elif self.restore_u:
                     q = self._apply_Ut(q_rot.unsqueeze(1)).squeeze(1)
                 else:
