@@ -59,45 +59,15 @@ def quantize_2d_vq(x: torch.Tensor, scale: torch.Tensor, codebook: torch.Tensor)
 
 def find_scale_2d(x: torch.Tensor, codebook: torch.Tensor = None) -> torch.Tensor:
     """
-    2D VQ용 MSE clipping scale 계산.
+    2D VQ용 shared scale 계산.
+    pair × 전체 column 기준 shared scale → isotropic 구조 보존.
     x: (d_row, d_col) UWV^T 공간
     Returns: scale (d_row//2, 1)
     """
-    if codebook is None:
-        codebook = get_codebook_2d(x.device)
-
-    x_pairs = x.float().reshape(-1, 2, x.shape[1])        # (d_row//2, 2, d_col)
-    x_flat  = x_pairs.reshape(x_pairs.shape[0], -1)        # (d_row//2, 2*d_col)
+    x_pairs = x.float().reshape(-1, 2, x.shape[1])  # (d_row//2, 2, d_col)
+    x_flat  = x_pairs.reshape(x_pairs.shape[0], -1)  # (d_row//2, 2*d_col)
     std     = x_flat.std(dim=1, keepdim=True).clamp(min=1e-8)
-
-    best_scale = std * 2.0
-    best_mse   = torch.full((x_flat.shape[0], 1), float('inf'), device=x.device)
-    cb         = codebook.to(x.device)
-
-    # 메모리 절약: pair별로 독립 계산 (d_col 방향 loop 제거)
-    # x_flat: (d_row//2, 2*d_col) → pair별 MSE search
-    for k in [1.8, 2.0, 2.2, 2.5, 3.0]:
-        scale_cand = std * k                                    # (d_row//2, 1)
-        # x_flat을 (d_row//2, d_col, 2)로 reshape
-        x_2d   = x_flat.reshape(x_flat.shape[0], -1, 2)        # (d_row//2, d_col, 2)
-        x_norm = (x_2d / scale_cand.unsqueeze(1)).clamp(-3, 3) # (d_row//2, d_col, 2)
-        # chunk 단위로 처리해서 메모리 절약
-        chunk  = 512
-        mse_sum = torch.zeros(x_flat.shape[0], device=x.device)
-        for c in range(0, x_2d.shape[1], chunk):
-            xc    = x_norm[:, c:c+chunk, :]                     # (d_row//2, chunk, 2)
-            dists = (xc.unsqueeze(-2) - cb.unsqueeze(0).unsqueeze(0)).pow(2).sum(-1)
-            idx   = dists.argmin(dim=-1)                         # (d_row//2, chunk)
-            xc_q  = cb[idx] * scale_cand.unsqueeze(1)           # (d_row//2, chunk, 2)
-            mse_sum += (x_2d[:, c:c+chunk, :] - xc_q).pow(2).sum(dim=(1,2))
-        mse = (mse_sum / (x_2d.shape[1] * 2)).unsqueeze(1)
-
-        better     = mse < best_mse
-        best_scale = torch.where(better, scale_cand, best_scale)
-        best_mse   = torch.where(better, mse, best_mse)
-
-    return best_scale  # (d_row//2, 1)
-
+    return std * 2.0  # shared scale: isotropic Gaussian N(0,1) 기준
 
 def get_nf_grid(bits: int) -> torch.Tensor:
     if bits == 2: return NF2_GRID
