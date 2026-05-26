@@ -275,6 +275,33 @@ def _quantize_e8_batch(W_rot: torch.Tensor, scale_e8: torch.Tensor) -> torch.Ten
     return Q_scaled.permute(0, 2, 1).reshape(d_row, count).to(W_rot.dtype)
 
 
+def quantize_e8_colwise(W_rot: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """
+    QuIP# Block LDLQ 방식: 8개 column을 묶어서 E8P quantization.
+    W_rot: (d_row, 8) - WV^T 공간의 8개 column
+    scale: (d_row, 1) - per-row scale
+    Returns: (d_row, 8) quantized
+    """
+    # (d_row, 8) → row별로 E8P nearest
+    x_norm = W_rot.float() / scale.clamp(min=1e-8)  # (d_row, 8)
+
+    pv, pe = _e8p_fast_qpart(x_norm + 0.25)
+    mv, me = _e8p_fast_qpart(x_norm - 0.25)
+    which  = (pe < me).unsqueeze(1)
+    q_norm = torch.where(which, pv - 0.25, mv + 0.25)
+    return (q_norm * scale).to(W_rot.dtype)          # (d_row, 8)
+
+
+def find_scale_e8_colwise(W_rot: torch.Tensor) -> torch.Tensor:
+    """
+    Column-wise E8P scale: per-row absmax 기반.
+    W_rot: (d_row, 8)
+    Returns: (d_row, 1)
+    """
+    std = W_rot.float().norm(dim=1, keepdim=True) / (8**0.5)
+    return (std * 0.9).clamp(min=1e-8)
+
+
 def find_scale_e8(W: torch.Tensor) -> torch.Tensor:
     """
     E8P scale 계산 (QuIP# scale_override=0.9 방식).
