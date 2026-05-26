@@ -151,24 +151,103 @@ def get_e8p_codebook(device='cpu') -> torch.Tensor:
     return _E8P_CODEBOOK.to(device)
 
 
+# ── E8P fast quantize (QuIP# fast_quantize_part 방식) ─────────────────────
+def _build_e8p_fast_components():
+    """grid_part (1366, 8) 및 norm 사전 계산"""
+    def get_norm12():
+        return torch.tensor([
+            [3,1,1,1,3,3,3,3],[1,3,1,1,3,3,3,3],[1,1,3,1,3,3,3,3],[1,1,1,3,3,3,3,3],
+            [3,3,3,1,3,3,1,1],[3,3,3,1,3,1,3,1],[3,3,3,1,1,3,3,1],[3,3,3,1,3,1,1,3],
+            [3,3,3,1,1,3,1,3],[3,3,3,1,1,1,3,3],[3,3,1,3,3,3,1,1],[3,3,1,3,3,1,3,1],
+            [3,3,1,3,1,3,3,1],[3,3,1,3,3,1,1,3],[3,3,1,3,1,3,1,3],[3,3,1,3,1,1,3,3],
+            [3,1,3,3,3,3,1,1],[3,1,3,3,3,1,3,1],[3,1,3,3,1,3,3,1],[3,1,3,3,3,1,1,3],
+            [3,1,3,3,1,3,1,3],[1,3,3,3,1,1,3,3],[1,3,3,3,3,3,1,1],[1,3,3,3,3,1,3,1],
+            [1,3,3,3,1,3,3,1],[1,3,3,3,3,1,1,3],[1,3,3,3,1,3,1,3],[1,1,3,3,1,3,3,3],
+            [3,3,1,1,3,3,3,1],
+        ]) / 2
+
+    intr  = torch.arange(-4, 4)
+    d8    = torch.cartesian_prod(*[intr]*8).float() + 0.5
+    abs_grid = torch.cat([
+        torch.unique(d8[(d8.sum(-1)%2==0) & (d8.norm(dim=-1)**2<=10)].abs(), dim=0),
+        get_norm12()
+    ], dim=0)  # (256, 8)
+
+    N = 1<<16
+    c_idx = torch.arange(N, dtype=torch.int32)
+    signs = c_idx & 255; abs_i = (c_idx>>8).long()
+    par = torch.zeros(N, dtype=torch.int32)
+    for i in range(8): par = par ^ ((signs>>i)&1)
+    signs = signs ^ par
+    base = abs_grid[abs_i][:, [0,4,1,5,2,6,3,7]]
+    sm = torch.stack([(~((signs>>i)&1).bool()).float()*2-1 for i in range(8)], dim=1)
+    grid = base * sm
+    pb = par.bool()
+    grid[pb] -= 0.25; grid[~pb] += 0.25
+
+    gp = grid[pb] + 0.25
+    mask = ((gp[:,:7]<0).sum(-1)<=1) & (gp[:,:7].min(-1).values>=-0.5)
+    grid_part = gp[mask]
+    return grid_part, (grid_part**2).sum(-1)
+
+_E8P_GRID_PART, _E8P_GRID_PART_NORM = _build_e8p_fast_components()
+
+
+def _e8p_fast_qpart(X: torch.Tensor) -> tuple:
+    """QuIP# fast_quantize_part: (N,8) → vals, err"""
+    gp   = _E8P_GRID_PART.to(X.device)
+    gpn  = _E8P_GRID_PART_NORM.to(X.device)
+    Xp   = X.abs().clone()
+    odd  = (X < 0).sum(dim=1) % 2 != 0
+    Xp[odd, 7] *= -1
+    msk  = torch.where(X < 0, torch.full_like(X, -1.0), torch.ones_like(X))
+    msk[odd, 7] *= -1
+    scores = 2 * Xp @ gp.T - gpn
+    ro     = gp[scores.argmax(dim=1)]
+    vals   = ro * msk
+    return vals, (X - vals).norm(dim=1)
+
+
 def quantize_e8(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """
-    E8P quantization (QuIP# 방식, 정확히 2bit/weight).
+    E8P quantization (QuIP# fast_quantize_part 방식).
     x:     (d_row, 1)
     scale: (d_row//8, 1)
-    GPU에서는 full matrix op으로 한 번에 처리 (65536개 병렬).
     Returns: (d_row, 1)
     """
-    cb = get_e8p_codebook(x.device)
-    x_blocks = x.reshape(-1, 8).float()          # (d_row//8, 8)
-    x_norm   = x_blocks / scale.clamp(min=1e-8)  # normalize
+    x_blocks = x.reshape(-1, 8).float()           # (d_row//8, 8)
+    x_norm   = x_blocks / scale.clamp(min=1e-8)   # normalize
 
+    pv, pe = _e8p_fast_qpart(x_norm + 0.25)
+    mv, me = _e8p_fast_qpart(x_norm - 0.25)
+    which  = (pe < me).unsqueeze(1)
+    q_norm = torch.where(which, pv - 0.25, mv + 0.25)
+    return (q_norm * scale).reshape(-1, 1)
+
+
+def _quantize_e8_batch(W_rot: torch.Tensor, scale_e8: torch.Tensor) -> torch.Tensor:
+    """
+    E8P batch quantization: W_rot 전체 block을 row-block 단위로 처리.
+    W_rot:    (d_row, count) - U @ W block
+    scale_e8: (d_row//8, 1)
+    Returns:  (d_row, count) quantized
+    """
+    cb = get_e8p_codebook(W_rot.device)
+    d_row, count = W_rot.shape
+    n_blocks = d_row // 8
+
+    # (n_blocks, 8, count) → (n_blocks, count, 8)
+    W_blocks = W_rot.float().reshape(n_blocks, 8, count).permute(0, 2, 1)  # (n_blocks, count, 8)
+    W_norm   = W_blocks / scale_e8.unsqueeze(1).clamp(min=1e-8)            # (n_blocks, count, 8)
+
+    Q_blocks = torch.zeros_like(W_norm)
+
+    # row-block 단위로 처리 (메모리 절약)
+    # GPU: 한 block(count, 8) vs 65536 → (count, 65536)
     def nearest_part(xn):
-        # GPU: (N, 65536) 한 번에 계산
-        # CPU: chunk 방식 (메모리 절약)
+        # xn: (count, 8)
         if xn.device.type == 'cuda':
-            # (N, 1, 8) - (1, 65536, 8) → (N, 65536)
-            dists = (xn.unsqueeze(1) - cb.unsqueeze(0)).pow(2).sum(-1)
+            dists = (xn.unsqueeze(1) - cb.unsqueeze(0)).pow(2).sum(-1)  # (count, 65536)
             idx   = dists.argmin(dim=1)
             return cb[idx], dists.min(dim=1).values
         else:
@@ -182,11 +261,18 @@ def quantize_e8(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
                 best_idx[better]  = mi[better] + c
             return cb[best_idx], best_dist
 
-    plus_vals,  plus_err  = nearest_part(x_norm + 0.25)
-    minus_vals, minus_err = nearest_part(x_norm - 0.25)
-    which = plus_err < minus_err
-    q_norm = torch.where(which.unsqueeze(1), plus_vals - 0.25, minus_vals + 0.25)
-    return (q_norm * scale).reshape(-1, 1)
+    for b in range(n_blocks):
+        xn = W_norm[b]                              # (count, 8)
+        pv, pe = nearest_part(xn + 0.25)
+        mv, me = nearest_part(xn - 0.25)
+        which  = pe < me
+        Q_blocks[b] = torch.where(which.unsqueeze(1), pv - 0.25, mv + 0.25)
+
+    # scale 복원: (n_blocks, count, 8) * (n_blocks, 1, 1)
+    Q_scaled = Q_blocks * scale_e8.unsqueeze(1).clamp(min=1e-8)  # (n_blocks, count, 8)
+
+    # → (d_row, count)
+    return Q_scaled.permute(0, 2, 1).reshape(d_row, count).to(W_rot.dtype)
 
 
 def find_scale_e8(W: torch.Tensor) -> torch.Tensor:
