@@ -19,6 +19,58 @@ NF8_GRID  = torch.tensor([-1.0, -0.5783, -0.3186, -0.1025, 0.1025, 0.3186, 0.578
 NF16_GRID = torch.tensor([-1.0, -0.7076, -0.5422, -0.4168, -0.3109, -0.2159, -0.1273, -0.0421,
                             0.0421,  0.1273,  0.2159,  0.3109,  0.4168,  0.5422,  0.7076,  1.0], dtype=torch.float32)
 
+# 2D cross-row Vector Quantization codebook (Gaussian-optimal, 16 centers = 2bit/weight)
+CODEBOOK_2D = None  # 처음 호출 시 생성
+
+def get_codebook_2d(device='cpu') -> torch.Tensor:
+    """Gaussian-optimal 2D codebook (16 centers, 2bit/weight)"""
+    global CODEBOOK_2D
+    if CODEBOOK_2D is None:
+        import numpy as np
+        np.random.seed(42)
+        from scipy.cluster.vq import kmeans
+        samples = np.random.randn(200000, 2).astype(np.float32)
+        cb, _ = kmeans(samples, 16, iter=200)
+        CODEBOOK_2D = torch.tensor(cb, dtype=torch.float32)
+    return CODEBOOK_2D.to(device)
+
+
+def quantize_2d_vq(x: torch.Tensor, scale: torch.Tensor, codebook: torch.Tensor) -> torch.Tensor:
+    """
+    2D cross-row vector quantization.
+    x:        (d_row, 1) - 하나의 column (d_row개 원소)
+    scale:    (d_row//2, 1) - 2개 row 쌍마다 scale
+    codebook: (16, 2) - 2D codebook
+
+    Returns: (d_row, 1) quantized
+    """
+    d_row = x.shape[0]
+    assert d_row % 2 == 0, "d_row must be even for 2D VQ"
+
+    x_pairs = x.reshape(-1, 2).float()          # (d_row//2, 2)
+    x_norm  = x_pairs / scale.clamp(min=1e-8)   # normalize
+
+    # nearest neighbor
+    cb = codebook.to(x.device)                  # (16, 2)
+    dists = (x_norm.unsqueeze(1) - cb.unsqueeze(0)).pow(2).sum(-1)  # (d_row//2, 16)
+    idx   = dists.argmin(dim=1)                 # (d_row//2,)
+    x_q   = cb[idx] * scale                     # (d_row//2, 2)
+
+    return x_q.reshape(-1, 1)                   # (d_row, 1)
+
+
+def find_scale_2d(x: torch.Tensor) -> torch.Tensor:
+    """
+    2D VQ용 scale 계산 (pair별 MSE clipping).
+    x: (d_row, d_col) WV^T 공간
+    Returns: scale (d_row//2, 1)
+    """
+    x_pairs = x.float().reshape(-1, 2, x.shape[1])  # (d_row//2, 2, d_col)
+    # pair별 std
+    std = x_pairs.reshape(x_pairs.shape[0], -1).std(dim=1, keepdim=True).clamp(min=1e-8)
+    return std  # (d_row//2, 1)
+
+
 def get_nf_grid(bits: int) -> torch.Tensor:
     if bits == 2: return NF2_GRID
     if bits == 3: return NF8_GRID
@@ -64,17 +116,14 @@ def find_params_nf(x: torch.Tensor, perchannel: bool = True, nf_grid: torch.Tens
     else:
         x_flat = x.float().flatten().unsqueeze(0)
 
-    # rotation 후 분포가 Gaussian에 가까워지므로 std 기반 scale 사용
-    # absmax 기반은 outlier에 민감하지만, rotation 후엔 outlier가 줄어들어
-    # std * k 형태로 search하는 게 더 적합
-    std    = x_flat.std(dim=1, keepdim=True).clamp(min=1e-8)
+    absmax = x_flat.abs().max(dim=1, keepdim=True).values.clamp(min=1e-8)
     grid   = nf_grid.to(x_flat.device)
 
-    best_scale = std * 2.0  # 초기값
+    best_scale = absmax.clone()
     best_mse   = torch.full((x_flat.shape[0], 1), float('inf'), device=x_flat.device)
 
-    for k in [1.5, 1.8, 2.0, 2.2, 2.5, 2.8, 3.0]:
-        scale_cand = std * k                                 # (d_row, 1)
+    for ratio in [0.75, 0.80, 0.85, 0.90, 0.95, 1.00]:
+        scale_cand = absmax * ratio                          # (d_row, 1)
         x_norm     = (x_flat / scale_cand).clamp(-1, 1)     # (d_row, d_col)
         dists      = (x_norm.unsqueeze(-1) - grid.unsqueeze(0).unsqueeze(0)) ** 2
         idx        = dists.argmin(dim=-1)                    # (d_row, d_col)

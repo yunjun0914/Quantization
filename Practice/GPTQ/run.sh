@@ -24,7 +24,7 @@ python -u main_llama.py \
     --bits 2 \
     --rot hadamard \
     --v2 \
-    --no_u \
+    --vq2d \
     --compare \
     --percdamp 0.01 \
     --dev cuda:0 

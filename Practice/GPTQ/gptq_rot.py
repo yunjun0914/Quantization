@@ -16,12 +16,12 @@ Rotated GPTQ Core v2
 import math
 import torch
 import torch.nn as nn
-from quantize import quantize, find_params, quantize_nf, find_params_nf, NF2_GRID, get_nf_grid
+from quantize import quantize, find_params, quantize_nf, find_params_nf, NF2_GRID, get_nf_grid, quantize_2d_vq, find_scale_2d, get_codebook_2d
 
 
 class RotatedGPTQ:
 
-    def __init__(self, layer: nn.Linear, U: torch.Tensor, V: torch.Tensor, restore_u: bool = True):
+    def __init__(self, layer: nn.Linear, U: torch.Tensor, V: torch.Tensor, restore_u: bool = True, use_2d_vq: bool = False):
         self.layer = layer
         self.dev   = layer.weight.device
         self.dtype = layer.weight.dtype
@@ -30,7 +30,8 @@ class RotatedGPTQ:
         self.d_row, self.d_col = W.shape
 
         self.U = U.to(self.dev).float() if U is not None else None
-        self.restore_u = restore_u if U is not None else None
+        self.restore_u = restore_u
+        self.use_2d_vq  = use_2d_vq if U is not None else None
         self.V = V.to(self.dev).float()
 
         self.H        = torch.zeros((self.d_col, self.d_col), device=self.dev)
@@ -99,8 +100,15 @@ class RotatedGPTQ:
         scale_all = torch.zeros((self.d_row, n_groups), device=self.dev)
         zero_all  = torch.zeros((self.d_row, n_groups), device=self.dev)
 
-        nf_grid = get_nf_grid(bits)   # 2→NF2, 3→NF8, 4→NF16, else None
-        use_nf  = nf_grid is not None
+        nf_grid  = get_nf_grid(bits)   # 2→NF2, 3→NF8, 4→NF16, else None
+        use_nf   = nf_grid is not None
+        use_2dvq = self.use_2d_vq and (bits == 2) and (self.d_row % 2 == 0)
+
+        # 2D VQ: per-pair scale 미리 계산
+        if use_2dvq:
+            codebook_2d = get_codebook_2d(self.dev)
+            W_rot_all   = self._apply_U(W)   # (d_row, d_col)
+            scale_2d    = find_scale_2d(W_rot_all)  # (d_row//2, 1)
 
         if groupsize <= 0:
             W_rot_full = self._apply_U(W)
@@ -148,17 +156,23 @@ class RotatedGPTQ:
                     zero  = zero_all[:, 0:1]
 
                 # ── 핵심: 양자화 시에만 U 회전 ──────────────────────────
-                col_rot = self._apply_U(col.unsqueeze(1)).squeeze(1)  # U @ col
-                if use_nf:
-                    q_rot = quantize_nf(col_rot.unsqueeze(-1), scale, nf_grid).squeeze(-1)
+                col_rot = self._apply_U(col.unsqueeze(1))  # (d_row, 1)
+
+                if use_2dvq:
+                    # 2D cross-row vector quantization
+                    q_rot = quantize_2d_vq(col_rot, scale_2d, codebook_2d)  # (d_row, 1)
+                elif use_nf:
+                    q_rot = quantize_nf(col_rot, scale, nf_grid)
                 else:
-                    q_rot = quantize(col_rot.unsqueeze(-1), scale, zero, maxq).squeeze(-1)
-                # restore_u=True: U^T 복원 → 순수 양자화 오차 전파 (our method)
-                # restore_u=False: V1 방식 → 회전 오차 포함 전파
+                    q_rot = quantize(col_rot, scale, zero, maxq)
+
+                q_rot = q_rot.squeeze(1)
+                col_rot = col_rot.squeeze(1)
+
                 if self.restore_u:
                     q = self._apply_Ut(q_rot.unsqueeze(1)).squeeze(1)  # U^T @ q_rot
                 else:
-                    q = q_rot  # V1: 복원 없음
+                    q = q_rot
 
                 Q1[:, j_loc]    = q
 

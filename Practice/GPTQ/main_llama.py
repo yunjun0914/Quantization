@@ -34,6 +34,7 @@ def parse_args():
     p.add_argument("--v2",        action="store_true", help="RotatedGPTQ v2 (globally shared V & U)")
     p.add_argument("--no_u",      action="store_true", help="ablation: U rotation 제거")
     p.add_argument("--v1_mode",    action="store_true", help="ablation: V1 방식 (U^T 복원 없음, 회전 오차 포함)")
+    p.add_argument("--vq2d",       action="store_true", help="2D cross-row vector quantization")
     p.add_argument("--dev",       type=str,   default="cuda:0")
     p.add_argument("--compare",   action="store_true", help="기존 GPTQ와 PPL 비교")
     return p.parse_args()
@@ -68,6 +69,7 @@ if __name__ == "__main__":
             eval_before = True,
             use_u       = not args.no_u,
             v1_mode     = args.v1_mode,
+            use_2d_vq   = args.vq2d,
         )
 
         if args.compare:
@@ -114,6 +116,7 @@ if __name__ == "__main__":
             eval_before = True,
             use_u       = not args.no_u,
             v1_mode     = args.v1_mode,
+            use_2d_vq   = args.vq2d,
         )
         print("\n" + "=" * 60)
         print(f"  FP16 baseline : {out['ppl_fp16']:.2f}")
