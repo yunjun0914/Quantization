@@ -73,7 +73,13 @@ def get_hadamard(d: int, device="cpu", seed: int = 0) -> torch.Tensor:
         dr = (torch.randint(0, 2, (d,), generator=g, device=device).float() * 2 - 1)
         return dl.unsqueeze(1) * H * dr.unsqueeze(0)
     else:
-        # d가 2의 거듭제곱 아님 → random orthogonal
+        # d가 2의 거듭제곱 아님
+        # d % 172 == 0이면 QuIP# H_64 ⊗ H_172 방식
+        if d % 172 == 0:
+            from had_utils import matmul_hadU
+            # H_d를 명시적 행렬로 생성: H @ I
+            eye = torch.eye(d, device=device)
+            return matmul_hadU(eye).T  # (d, d) Hadamard matrix
         return get_random_orthogonal(d, seed=seed, device=device)
 
 def get_rotation(d: int, mode: str = "random", seed: int = 0, device="cpu") -> torch.Tensor:
