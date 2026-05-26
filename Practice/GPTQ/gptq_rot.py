@@ -21,7 +21,7 @@ from quantize import quantize, find_params, quantize_nf, find_params_nf, NF2_GRI
 
 class RotatedGPTQ:
 
-    def __init__(self, layer: nn.Linear, U: torch.Tensor, V: torch.Tensor):
+    def __init__(self, layer: nn.Linear, U: torch.Tensor, V: torch.Tensor, restore_u: bool = True):
         self.layer = layer
         self.dev   = layer.weight.device
         self.dtype = layer.weight.dtype
@@ -29,7 +29,8 @@ class RotatedGPTQ:
         W = layer.weight.data
         self.d_row, self.d_col = W.shape
 
-        self.U = U.to(self.dev).float() if U is not None else None if U is not None else None
+        self.U = U.to(self.dev).float() if U is not None else None
+        self.restore_u = restore_u if U is not None else None
         self.V = V.to(self.dev).float()
 
         self.H        = torch.zeros((self.d_col, self.d_col), device=self.dev)
@@ -152,7 +153,12 @@ class RotatedGPTQ:
                     q_rot = quantize_nf(col_rot.unsqueeze(-1), scale, nf_grid).squeeze(-1)
                 else:
                     q_rot = quantize(col_rot.unsqueeze(-1), scale, zero, maxq).squeeze(-1)
-                q       = self._apply_Ut(q_rot.unsqueeze(1)).squeeze(1)  # U^T @ q_rot
+                # restore_u=True: U^T 복원 → 순수 양자화 오차 전파 (our method)
+                # restore_u=False: V1 방식 → 회전 오차 포함 전파
+                if self.restore_u:
+                    q = self._apply_Ut(q_rot.unsqueeze(1)).squeeze(1)  # U^T @ q_rot
+                else:
+                    q = q_rot  # V1: 복원 없음
 
                 Q1[:, j_loc]    = q
 
