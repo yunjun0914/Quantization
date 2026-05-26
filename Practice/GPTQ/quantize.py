@@ -94,61 +94,85 @@ def find_scale_2d(x: torch.Tensor, codebook: torch.Tensor = None) -> torch.Tenso
 
     return best_scale  # (d_row//2, 1)
 
-def e8_nearest(x: torch.Tensor) -> torch.Tensor:
-    """
-    E8 lattice nearest neighbor.
-    E8 = D8 ∪ (D8 + [0.5,...,0.5])
-    D8: 합이 짝수인 정수 벡터
-    x: (..., 8)
-    """
-    z1 = torch.round(x)
-    z2 = torch.round(x - 0.5) + 0.5
+# E8 subcodebook (2bit/weight, norm²≤12, ~59889개 ≈ 1.98bit/weight)
+import os as _os
+_E8_CB_PATH = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "e8_codebook_2bit.pt")
+_E8_CODEBOOK = None
 
-    def project_D8(z, x_ref):
-        s = z.long().sum(dim=-1, keepdim=True) % 2
-        err = (z - x_ref).abs()
-        idx = err.argmax(dim=-1, keepdim=True)
-        sign = torch.where(
-            z.gather(-1, idx) > x_ref.gather(-1, idx),
-            torch.tensor(-1.0, device=z.device),
-            torch.tensor(1.0, device=z.device)
-        )
-        delta = torch.zeros_like(z)
-        delta.scatter_(-1, idx, sign)
-        return z + delta * s.float()
-
-    z1_d8 = project_D8(z1, x)
-    z2_d8 = project_D8(z2, x)
-    dist1 = (x - z1_d8).pow(2).sum(dim=-1, keepdim=True)
-    dist2 = (x - z2_d8).pow(2).sum(dim=-1, keepdim=True)
-    return torch.where(dist1 <= dist2, z1_d8, z2_d8)
+def get_e8_codebook(device='cpu') -> torch.Tensor:
+    global _E8_CODEBOOK
+    if _E8_CODEBOOK is None:
+        if _os.path.exists(_E8_CB_PATH):
+            _E8_CODEBOOK = torch.load(_E8_CB_PATH, weights_only=True)
+        else:
+            raise FileNotFoundError(f"E8 codebook not found: {_E8_CB_PATH}")
+    return _E8_CODEBOOK.to(device)
 
 
 def quantize_e8(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """
-    E8 lattice quantization.
-    x:     (d_row, 1) - 하나의 column
-    scale: (d_row//8, 1) - 8개 row block마다 shared scale
-    Returns: (d_row, 1) quantized
+    E8 subcodebook quantization (진짜 2bit/weight).
+    x:     (d_row, 1)
+    scale: (d_row//8, 1)
+    Returns: (d_row, 1)
     """
+    cb = get_e8_codebook(x.device)
     x_blocks = x.reshape(-1, 8).float()           # (d_row//8, 8)
-    x_norm   = x_blocks / scale.clamp(min=1e-8)   # scale로 정규화
-    x_q      = e8_nearest(x_norm)                 # E8 nearest
-    return (x_q * scale).reshape(-1, 1)
+    x_norm   = x_blocks / scale.clamp(min=1e-8)   # normalize
+
+    # chunk-wise nearest neighbor (메모리 절약)
+    best_idx  = torch.zeros(len(x_blocks), dtype=torch.long, device=x.device)
+    best_dist = torch.full((len(x_blocks),), float('inf'), device=x.device)
+    chunk = 1024
+    for c in range(0, len(cb), chunk):
+        cb_c  = cb[c:c+chunk]
+        dists = (x_norm.unsqueeze(1) - cb_c.unsqueeze(0)).pow(2).sum(-1)
+        min_d, min_i = dists.min(dim=1)
+        better = min_d < best_dist
+        best_dist[better] = min_d[better]
+        best_idx[better]  = min_i[better] + c
+
+    return (cb[best_idx] * scale).reshape(-1, 1)
 
 
 def find_scale_e8(W: torch.Tensor) -> torch.Tensor:
     """
-    E8 VQ용 scale 계산.
+    E8 VQ용 MSE clipping scale.
     W: (d_row, d_col) UWV^T 공간
     Returns: scale (d_row//8, 1)
-    optimal scale: std * 0.3 (Gaussian에서 E8 MSE 최소화)
     """
+    cb = get_e8_codebook(W.device)
     d_row, d_col = W.shape
     x_blocks = W.float().reshape(-1, 8, d_col)    # (d_row//8, 8, d_col)
-    x_flat   = x_blocks.reshape(x_blocks.shape[0], -1)
+    x_flat   = x_blocks.reshape(x_blocks.shape[0], -1)  # (d_row//8, 8*d_col)
     std      = x_flat.std(dim=1, keepdim=True).clamp(min=1e-8)
-    return std * 0.3   # E8 optimal scale for Gaussian
+
+    best_scale = std * 1.0
+    best_mse   = torch.full((len(std), 1), float('inf'), device=W.device)
+
+    x_8d = x_flat.reshape(len(std), -1, 8)  # (d_row//8, d_col, 8)
+    for k in [0.7, 0.8, 0.9, 1.0, 1.1, 1.2]:
+        sc = std * k
+        x_norm = (x_8d / sc.unsqueeze(1)).clamp(-4, 4)
+        mse_sum = torch.zeros(len(std), device=W.device)
+        chunk_col = 64
+        for c in range(0, x_8d.shape[1], chunk_col):
+            xc = x_norm[:, c:c+chunk_col, :]         # (d_row//8, chunk, 8)
+            xc_flat = xc.reshape(-1, 8)
+            # E8 nearest (infinite lattice - approximation for scale search)
+            z1 = torch.round(xc_flat)
+            z2 = torch.round(xc_flat - 0.5) + 0.5
+            d1 = (xc_flat - z1).pow(2).sum(-1)
+            d2 = (xc_flat - z2).pow(2).sum(-1)
+            xc_q = torch.where(d1.unsqueeze(1) <= d2.unsqueeze(1), z1, z2)
+            xc_q = xc_q.reshape(len(std), -1, 8)
+            mse_sum += (x_8d[:, c:c+chunk_col, :] - xc_q * sc.unsqueeze(1)).pow(2).sum(dim=(1,2))
+        mse = (mse_sum / (x_8d.shape[1]*8)).unsqueeze(1)
+        better = mse < best_mse
+        best_scale = torch.where(better, sc, best_scale)
+        best_mse   = torch.where(better, mse, best_mse)
+
+    return best_scale
 
 
 def get_nf_grid(bits: int) -> torch.Tensor:
