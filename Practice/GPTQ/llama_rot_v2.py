@@ -76,8 +76,8 @@ def llama_rot_sequential_v2(
         "self_attn.k_proj": (U_qk if use_u else None, V),
         "self_attn.v_proj": (U_v  if use_u else None, V),
         "self_attn.o_proj": (U_qk if use_u else None, V),
-        "mlp.gate_proj":    (None, V),   # SwiGLU pairing 보존: V만
-        "mlp.up_proj":      (None, V),
+        "mlp.gate_proj":    (U_gu if use_u else None, V),   # E8P: U_gu 시도
+        "mlp.up_proj":      (U_gu if use_u else None, V),
         "mlp.down_proj":    (U_d  if use_u else None, U_gu),
     }
 
