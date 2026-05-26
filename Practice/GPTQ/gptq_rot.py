@@ -165,10 +165,11 @@ class RotatedGPTQ:
                 col_rot = self._apply_U(col.unsqueeze(1))  # (d_row, 1)
 
                 if use_e8vq:
-                    # E8P: 현재 col_rot 기준으로 scale 즉시 계산 → 오차 전파 반영
-                    scale_e8_col = (col_rot.reshape(-1, 8)
-                                    .norm(dim=1, keepdim=True) / (8**0.5) * 0.9
-                                    ).clamp(min=1e-8)         # (d_row//8, 1)
+                    # E8P: column 전체 norm 기준 scalar scale (진짜 2bpw)
+                    # col_rot 전체를 하나의 scale로 → per-column adaptive + 2bpw
+                    scale_e8_scalar = (col_rot.norm() / (self.d_row ** 0.5) * 0.9
+                                       ).clamp(min=1e-8)       # scalar
+                    scale_e8_col    = scale_e8_scalar.expand(self.d_row // 8, 1)
                     q_rot = quantize_e8(col_rot, scale_e8_col)  # (d_row, 1)
                 elif use_2dvq:
                     # 2D cross-row vector quantization
