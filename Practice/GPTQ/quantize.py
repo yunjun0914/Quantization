@@ -64,14 +64,17 @@ def find_params_nf(x: torch.Tensor, perchannel: bool = True, nf_grid: torch.Tens
     else:
         x_flat = x.float().flatten().unsqueeze(0)
 
-    absmax = x_flat.abs().max(dim=1, keepdim=True).values.clamp(min=1e-8)
+    # rotation 후 분포가 Gaussian에 가까워지므로 std 기반 scale 사용
+    # absmax 기반은 outlier에 민감하지만, rotation 후엔 outlier가 줄어들어
+    # std * k 형태로 search하는 게 더 적합
+    std    = x_flat.std(dim=1, keepdim=True).clamp(min=1e-8)
     grid   = nf_grid.to(x_flat.device)
 
-    best_scale = absmax.clone()
+    best_scale = std * 2.0  # 초기값
     best_mse   = torch.full((x_flat.shape[0], 1), float('inf'), device=x_flat.device)
 
-    for ratio in [0.75, 0.80, 0.85, 0.90, 0.95, 1.00]:
-        scale_cand = absmax * ratio                          # (d_row, 1)
+    for k in [1.5, 1.8, 2.0, 2.2, 2.5, 2.8, 3.0]:
+        scale_cand = std * k                                 # (d_row, 1)
         x_norm     = (x_flat / scale_cand).clamp(-1, 1)     # (d_row, d_col)
         dists      = (x_norm.unsqueeze(-1) - grid.unsqueeze(0).unsqueeze(0)) ** 2
         idx        = dists.argmin(dim=-1)                    # (d_row, d_col)
