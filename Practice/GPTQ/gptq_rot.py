@@ -112,11 +112,7 @@ class RotatedGPTQ:
             W_rot_all   = self._apply_U(W)
             scale_2d    = find_scale_2d(W_rot_all)  # (d_row//2, 1)
 
-        # E8P column-wise: per-row scale 미리 계산
-        if use_e8vq:
-            W_rot_all    = self._apply_U(W)
-            scale_e8_col = find_scale_e8_colwise(W_rot_all)  # (d_row, 1)
-            _e8p_block_cache = None
+        # E8P: scale은 매 column마다 col_rot 기준으로 계산
 
         if groupsize <= 0:
             W_rot_full = self._apply_U(W)
@@ -169,21 +165,11 @@ class RotatedGPTQ:
                 col_rot = self._apply_U(col.unsqueeze(1))  # (d_row, 1)
 
                 if use_e8vq:
-                    # E8P column-wise (QuIP# Block LDLQ 방식)
-                    # W1 (오차 전파된 현재 W)에서 8개 column 묶음
-                    if j_global % 8 == 0:
-                        loc_end = min(j_loc + 8, count)
-                        actual  = loc_end - j_loc
-                        W1_blk  = W1[:, j_loc:loc_end]        # W1에서 가져옴 ✅
-                        W_rot_blk = self._apply_U(W1_blk)
-                        if actual < 8:
-                            pad = torch.zeros(self.d_row, 8-actual, device=W1.device)
-                            W_rot_blk = torch.cat([W_rot_blk, pad], dim=1)
-                        _e8p_block_cache = quantize_e8_colwise(
-                            W_rot_blk, scale_e8_col)            # (d_row, 8)
-                    col_in_block = j_global % 8
-                    q_rot = self._apply_Ut(
-                        _e8p_block_cache[:, col_in_block:col_in_block+1])
+                    # E8P: 현재 col_rot 기준으로 scale 즉시 계산 → 오차 전파 반영
+                    scale_e8_col = (col_rot.reshape(-1, 8)
+                                    .norm(dim=1, keepdim=True) / (8**0.5) * 0.9
+                                    ).clamp(min=1e-8)         # (d_row//8, 1)
+                    q_rot = quantize_e8(col_rot, scale_e8_col)  # (d_row, 1)
                 elif use_2dvq:
                     # 2D cross-row vector quantization
                     q_rot = quantize_2d_vq(col_rot, scale_2d, codebook_2d)  # (d_row, 1)
@@ -195,9 +181,7 @@ class RotatedGPTQ:
                 q_rot = q_rot.squeeze(1)
                 col_rot = col_rot.squeeze(1)
 
-                if use_e8vq:
-                    q = q_rot.squeeze(-1) if q_rot.dim() > 1 else q_rot
-                elif self.restore_u:
+                if self.restore_u:
                     q = self._apply_Ut(q_rot.unsqueeze(1)).squeeze(1)
                 else:
                     q = q_rot
