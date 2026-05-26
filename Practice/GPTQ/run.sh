@@ -26,6 +26,5 @@ python -u main_llama.py \
     --v2 \
     --no_u \
     --compare \
-    --groupsize 128 \
     --percdamp 0.01 \
     --dev cuda:0 
