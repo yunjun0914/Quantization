@@ -24,7 +24,6 @@ python -u main_llama.py \
     --bits 2 \
     --rot hadamard \
     --v2 \
-    --no_u \
     --e8 \
     --compare \
     --percdamp 0.01 \
