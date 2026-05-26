@@ -24,8 +24,6 @@ python -u main_llama.py \
     --bits 2 \
     --rot hadamard \
     --v2 \
-    --v1_mode \
     --compare \
-    --groupsize 128 \
     --percdamp 0.01 \
     --dev cuda:0 
