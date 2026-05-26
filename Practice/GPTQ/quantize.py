@@ -156,24 +156,31 @@ def quantize_e8(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     E8P quantization (QuIP# 방식, 정확히 2bit/weight).
     x:     (d_row, 1)
     scale: (d_row//8, 1)
+    GPU에서는 full matrix op으로 한 번에 처리 (65536개 병렬).
     Returns: (d_row, 1)
     """
     cb = get_e8p_codebook(x.device)
-    x_blocks = x.reshape(-1, 8).float()
-    x_norm   = x_blocks / scale.clamp(min=1e-8)
+    x_blocks = x.reshape(-1, 8).float()          # (d_row//8, 8)
+    x_norm   = x_blocks / scale.clamp(min=1e-8)  # normalize
 
-    # QuIP# fast_quantize 방식: X±1/4 두 경우 비교
     def nearest_part(xn):
-        best_idx  = torch.zeros(len(xn), dtype=torch.long, device=x.device)
-        best_dist = torch.full((len(xn),), float('inf'), device=x.device)
-        chunk = 2048
-        for c in range(0, len(cb), chunk):
-            dists = (xn.unsqueeze(1) - cb[c:c+chunk].unsqueeze(0)).pow(2).sum(-1)
-            md, mi = dists.min(dim=1)
-            better = md < best_dist
-            best_dist[better] = md[better]
-            best_idx[better]  = mi[better] + c
-        return cb[best_idx], best_dist
+        # GPU: (N, 65536) 한 번에 계산
+        # CPU: chunk 방식 (메모리 절약)
+        if xn.device.type == 'cuda':
+            # (N, 1, 8) - (1, 65536, 8) → (N, 65536)
+            dists = (xn.unsqueeze(1) - cb.unsqueeze(0)).pow(2).sum(-1)
+            idx   = dists.argmin(dim=1)
+            return cb[idx], dists.min(dim=1).values
+        else:
+            best_idx  = torch.zeros(len(xn), dtype=torch.long, device=xn.device)
+            best_dist = torch.full((len(xn),), float('inf'), device=xn.device)
+            for c in range(0, len(cb), 2048):
+                dists = (xn.unsqueeze(1) - cb[c:c+2048].unsqueeze(0)).pow(2).sum(-1)
+                md, mi = dists.min(dim=1)
+                better = md < best_dist
+                best_dist[better] = md[better]
+                best_idx[better]  = mi[better] + c
+            return cb[best_idx], best_dist
 
     plus_vals,  plus_err  = nearest_part(x_norm + 0.25)
     minus_vals, minus_err = nearest_part(x_norm - 0.25)
