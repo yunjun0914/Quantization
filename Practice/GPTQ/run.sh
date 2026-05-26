@@ -23,6 +23,7 @@ python -u main_llama.py \
     --model ~/Quantization/Omni-Quant/OmniQuant/models/llama2-7b \
     --bits 3 \
     --rot hadamard \
+    --no_u \
     --v2 \
     --e8 \
     --compare \
