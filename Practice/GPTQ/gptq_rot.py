@@ -112,7 +112,12 @@ class RotatedGPTQ:
             W_rot_all   = self._apply_U(W)
             scale_2d    = find_scale_2d(W_rot_all)  # (d_row//2, 1)
 
-        # E8P: scale은 매 column마다 col_rot 기준으로 계산
+        # E8P rank-1 scale: S matrix 수집 후 rank-1 SVD 근사
+        # S[k, i] = scale of block k at column i (오차 전파 반영)
+        if use_e8vq:
+            n_blocks_e8 = self.d_row // 8
+            scale_matrix_e8 = torch.zeros(n_blocks_e8, self.d_col,
+                                           device=W.device, dtype=torch.float32)
 
         if groupsize <= 0:
             W_rot_full = self._apply_U(W)
@@ -165,20 +170,13 @@ class RotatedGPTQ:
                 col_rot = self._apply_U(col.unsqueeze(1))  # (d_row, 1)
 
                 if use_e8vq:
-                    # E8P: 16개 E8P block (=128 row)마다 scale 공유
-                    # GPTQ groupsize=128과 동일 granularity
-                    # bpw = 2 + 16/(16×8) = 2 + 0.125 = 2.125bpw
-                    G = 16  # 16개 E8P block = 128 row
-                    n_blocks = self.d_row // 8
-                    scale_e8_col = torch.zeros(n_blocks, 1,
-                                               device=col_rot.device,
-                                               dtype=col_rot.dtype)
-                    for g_start in range(0, n_blocks, G):
-                        g_end  = min(g_start + G, n_blocks)
-                        chunk  = col_rot[g_start*8 : g_end*8]
-                        s = (chunk.norm() / (chunk.numel()**0.5) * 0.9).clamp(min=1e-8)
-                        scale_e8_col[g_start:g_end] = s
-                    q_rot = quantize_e8(col_rot, scale_e8_col)  # (d_row, 1)
+                    # per-block scale 계산 (오차 전파된 col_rot 기준)
+                    scale_e8_col = (col_rot.reshape(-1, 8)
+                                    .norm(dim=1, keepdim=True) / (8**0.5) * 0.9
+                                    ).clamp(min=1e-8).float()       # (d_row//8, 1)
+                    scale_matrix_e8[:, j_global] = scale_e8_col.squeeze(1)
+                    q_rot = quantize_e8(col_rot,
+                                        scale_e8_col.to(col_rot.dtype))  # (d_row, 1)
                 elif use_2dvq:
                     # 2D cross-row vector quantization
                     q_rot = quantize_2d_vq(col_rot, scale_2d, codebook_2d)  # (d_row, 1)
@@ -216,6 +214,26 @@ class RotatedGPTQ:
         Q         = Q.to(self.dtype)
         scale_all = scale_all.to(self.dtype)
         zero_all  = zero_all.to(self.dtype)
+
+        # E8P rank-1 log-domain fit: log(S) ≈ alpha_k + beta_j
+        # S[k,j] ≈ exp(alpha_k) * exp(beta_j) = a[k] * b[j]
+        # a: (d_row//8,) → U에 흡수, b: (d_col,) → V에 흡수
+        if use_e8vq:
+            S   = scale_matrix_e8.float().clamp(min=1e-8)      # (d_row//8, d_col)
+            L   = torch.log(S)                                  # log-domain
+            g   = L.mean()                                      # global mean
+            a_k = L.mean(dim=1) - g / 2                        # (d_row//8,) row factor
+            b_j = L.mean(dim=0) - g / 2                        # (d_col,)    col factor
+            a   = torch.exp(a_k)                               # (d_row//8,)
+            b   = torch.exp(b_j)                               # (d_col,)
+
+            # 근사 품질 확인
+            S_hat = a.unsqueeze(1) * b.unsqueeze(0)
+            rel_err = ((S - S_hat) / S).abs().mean().item()
+            print(f"  [E8P log rank-1] rel_err: {rel_err:.4f}")
+
+            self.e8p_scale_u = a.to(self.dtype)                # (d_row//8,)
+            self.e8p_scale_v = b.to(self.dtype)                # (d_col,)
 
         return Q, scale_all, zero_all, Losses
 
