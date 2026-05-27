@@ -112,16 +112,11 @@ class RotatedGPTQ:
             W_rot_all   = self._apply_U(W)
             scale_2d    = find_scale_2d(W_rot_all)  # (d_row//2, 1)
 
-        # E8P per-layer scalar scale + S matrix 수집 (rank-1 분석용)
+        # E8P per-layer scalar scale (QuIP# 방식)
         if use_e8vq:
-            n_blocks_e8 = self.d_row // 8
-            scale_matrix_e8 = torch.zeros(n_blocks_e8, self.d_col,
-                                           device=W.device, dtype=torch.float32)
-            # per-layer RMS scale (QuIP# 방식)
             W_rot_all = self._apply_U(W)
             scale_e8_layer = (W_rot_all.square().mean().sqrt() / 0.9
                               ).clamp(min=1e-8).to(W.device)
-            print(f"  [E8P per-layer scale] {scale_e8_layer.item():.4f}")
 
         if groupsize <= 0:
             W_rot_full = self._apply_U(W)
@@ -174,11 +169,8 @@ class RotatedGPTQ:
                 col_rot = self._apply_U(col.unsqueeze(1))  # (d_row, 1)
 
                 if use_e8vq:
-                    # per-block scale 수집 (오차 전파 반영)
-                    scale_e8_col = (col_rot.reshape(-1, 8)
-                                    .norm(dim=1, keepdim=True) / (8**0.5) * 0.9
-                                    ).clamp(min=1e-8).float()
-                    scale_matrix_e8[:, j_global] = scale_e8_col.squeeze(1)
+                    # per-layer scalar scale
+                    scale_e8_col = scale_e8_layer.expand(self.d_row // 8, 1)
                     q_rot = quantize_e8(col_rot,
                                         scale_e8_col.to(col_rot.dtype))  # (d_row, 1)
                 elif use_2dvq:
@@ -219,37 +211,7 @@ class RotatedGPTQ:
         scale_all = scale_all.to(self.dtype)
         zero_all  = zero_all.to(self.dtype)
 
-        # E8P rank-1 log-domain fit: log(S) ≈ alpha_k + beta_j
-        # S[k,j] ≈ exp(alpha_k) * exp(beta_j) = a[k] * b[j]
-        # a: (d_row//8,) → U에 흡수, b: (d_col,) → V에 흡수
-        if use_e8vq:
-            S   = scale_matrix_e8.float().clamp(min=1e-8)      # (d_row//8, d_col)
-            L   = torch.log(S)                                  # log-domain
-            g   = L.mean()                                      # global mean
-            a_k = L.mean(dim=1) - g / 2                        # (d_row//8,) row factor
-            b_j = L.mean(dim=0) - g / 2                        # (d_col,)    col factor
-            a   = torch.exp(a_k)                               # (d_row//8,)
-            b   = torch.exp(b_j)                               # (d_col,)
 
-            # 근사 품질 확인
-            S_hat = a.unsqueeze(1) * b.unsqueeze(0)
-            rel_err = ((S - S_hat) / S).abs().mean().item()
-            print(f"  [E8P log rank-1] rel_err: {rel_err:.4f}")
-
-            self.e8p_scale_u = a.to(self.dtype)                # (d_row//8,)
-            self.e8p_scale_v = b.to(self.dtype)                # (d_col,)
-
-            # rank-1 scale로 Q를 재양자화
-            # S_hat[k, j] = a[k] * b[j]
-            print(f"  [E8P rank-1] re-quantizing with rank-1 scale...")
-            W_orig = self.layer.weight.data.clone().float() @ self.V.float().T
-            W_rot_r1 = self._apply_U(W_orig.to(W.device))
-            Q_r1 = torch.zeros_like(W_rot_r1)
-            for j in range(self.d_col):
-                col_r = W_rot_r1[:, j]
-                sc_r1 = (a * b[j]).unsqueeze(1).to(col_r.dtype)  # (d_row//8, 1)
-                Q_r1[:, j] = quantize_e8(col_r.unsqueeze(1), sc_r1).squeeze(1)
-            Q = self._apply_Ut(Q_r1).to(self.dtype)
 
         return Q, scale_all, zero_all, Losses
 
