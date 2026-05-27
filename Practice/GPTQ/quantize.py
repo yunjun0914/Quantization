@@ -168,9 +168,11 @@ def quantize_e8_indexed(x: torch.Tensor, scale: torch.Tensor):
     which  = (pe < me).unsqueeze(1)
     q_norm = torch.where(which, pv - 0.25, mv + 0.25)
 
-    # nearest index in full codebook
-    dists  = (q_norm.unsqueeze(1) - cb.unsqueeze(0)).pow(2).sum(-1)
-    idx    = dists.argmin(dim=1).to(torch.int32)   # (d_row//8,)
+    # q_norm은 E8P codebook의 한 점 → 직접 index 계산
+    # argmax trick: argmin||q-cb||² = argmax(2q@cb.T - ||cb||²)
+    cb_norm = (cb ** 2).sum(dim=-1)
+    scores  = 2 * q_norm @ cb.T - cb_norm        # (d_row//8, 65536)
+    idx     = scores.argmax(dim=1).to(torch.int32)  # (d_row//8,)
 
     q_float = (q_norm * scale).reshape(-1, 1)
     return q_float, idx
