@@ -165,11 +165,18 @@ class RotatedGPTQ:
                 col_rot = self._apply_U(col.unsqueeze(1))  # (d_row, 1)
 
                 if use_e8vq:
-                    # E8P: column 전체 norm 기준 scalar scale (진짜 2bpw)
-                    # col_rot 전체를 하나의 scale로 → per-column adaptive + 2bpw
-                    scale_e8_scalar = (col_rot.norm() / (self.d_row ** 0.5) * 0.9
-                                       ).clamp(min=1e-8)       # scalar
-                    scale_e8_col    = scale_e8_scalar.expand(self.d_row // 8, 1)
+                    # E8P: 128 E8P block (=1024 row)마다 scale 공유
+                    # bpw = 2 + 16/(8×128) ≈ 2.016bpw ✅
+                    G = 128  # E8P block groupsize
+                    n_blocks = self.d_row // 8
+                    scale_e8_col = torch.zeros(n_blocks, 1,
+                                               device=col_rot.device,
+                                               dtype=col_rot.dtype)
+                    for g_start in range(0, n_blocks, G):
+                        g_end  = min(g_start + G, n_blocks)
+                        chunk  = col_rot[g_start*8 : g_end*8]
+                        s = (chunk.norm() / (chunk.numel()**0.5) * 0.9).clamp(min=1e-8)
+                        scale_e8_col[g_start:g_end] = s
                     q_rot = quantize_e8(col_rot, scale_e8_col)  # (d_row, 1)
                 elif use_2dvq:
                     # 2D cross-row vector quantization
