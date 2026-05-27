@@ -3,7 +3,7 @@
 #SBATCH --job-name=gptq_llama
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=24
 #SBATCH --mem=60G
 #SBATCH --time=6:00:00
 #SBATCH --output=/home/yunjun0914/Quantization/Practice/logs/%x_%j.out
