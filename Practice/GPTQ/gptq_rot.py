@@ -112,12 +112,16 @@ class RotatedGPTQ:
             W_rot_all   = self._apply_U(W)
             scale_2d    = find_scale_2d(W_rot_all)  # (d_row//2, 1)
 
-        # E8P rank-1 scale: S matrix 수집 후 rank-1 SVD 근사
-        # S[k, i] = scale of block k at column i (오차 전파 반영)
+        # E8P per-layer scalar scale + S matrix 수집 (rank-1 분석용)
         if use_e8vq:
             n_blocks_e8 = self.d_row // 8
             scale_matrix_e8 = torch.zeros(n_blocks_e8, self.d_col,
                                            device=W.device, dtype=torch.float32)
+            # per-layer RMS scale (QuIP# 방식)
+            W_rot_all = self._apply_U(W)
+            scale_e8_layer = (W_rot_all.square().mean().sqrt() / 0.9
+                              ).clamp(min=1e-8).to(W.device)
+            print(f"  [E8P per-layer scale] {scale_e8_layer.item():.4f}")
 
         if groupsize <= 0:
             W_rot_full = self._apply_U(W)
@@ -170,11 +174,9 @@ class RotatedGPTQ:
                 col_rot = self._apply_U(col.unsqueeze(1))  # (d_row, 1)
 
                 if use_e8vq:
-                    # per-block scale 계산 (오차 전파된 col_rot 기준)
-                    scale_e8_col = (col_rot.reshape(-1, 8)
-                                    .norm(dim=1, keepdim=True) / (8**0.5) * 0.9
-                                    ).clamp(min=1e-8).float()       # (d_row//8, 1)
-                    scale_matrix_e8[:, j_global] = scale_e8_col.squeeze(1)
+                    # per-layer scalar scale (모든 block, column 공유)
+                    scale_e8_col = scale_e8_layer.expand(self.d_row // 8, 1)
+                    scale_matrix_e8[:, j_global] = scale_e8_layer.item()
                     q_rot = quantize_e8(col_rot,
                                         scale_e8_col.to(col_rot.dtype))  # (d_row, 1)
                 elif use_2dvq:
