@@ -110,6 +110,7 @@ class RotatedGPTQ:
             W_rot_all = self._apply_U(W)
             scale_e8_layer = (W_rot_all.square().mean().sqrt() / 0.9
                               ).clamp(min=1e-8).to(W.device)
+            idx_col_list = []
 
         if groupsize <= 0:
             W_rot_full = self._apply_U(W)
@@ -164,8 +165,12 @@ class RotatedGPTQ:
                 if use_e8vq:
                     # per-layer scalar scale
                     scale_e8_col = scale_e8_layer.expand(self.d_row // 8, 1)
-                    q_rot = quantize_e8(col_rot,
-                                        scale_e8_col.to(col_rot.dtype))  # (d_row, 1)
+                    if getattr(self, 'export_mode', False):
+                        q_rot, _idx = quantize_e8_indexed(col_rot, scale_e8_col.to(col_rot.dtype))
+                        idx_col_list.append(_idx.cpu())
+                    else:
+                        q_rot = quantize_e8(col_rot,
+                                            scale_e8_col.to(col_rot.dtype))
                 elif use_nf:
                     q_rot = quantize_nf(col_rot, scale, nf_grid)
                 else:
@@ -203,17 +208,10 @@ class RotatedGPTQ:
 
 
 
-        # export 모드: E8P index 저장
-        if use_e8vq and getattr(self, 'export_mode', False):
-            n_blocks = self.d_row // 8
-            idx_all  = torch.zeros(n_blocks, self.d_col, dtype=torch.int32)
-            for i in range(self.d_col):
-                col     = Q[:, i:i+1].float()
-                col_rot = self._apply_U(col)
-                _, idx  = quantize_e8_indexed(col_rot, scale_e8_layer.expand(n_blocks,1))
-                idx_all[:, i] = idx
-            self.e8p_idx   = idx_all          # (d_row//8, d_col) int32
-            self.e8p_scale = scale_e8_layer   # scalar
+        # export 모드: inner loop에서 수집한 idx → matrix
+        if use_e8vq and getattr(self, 'export_mode', False) and idx_col_list:
+            self.e8p_idx   = torch.stack(idx_col_list, dim=1)  # (d_row//8, d_col)
+            self.e8p_scale = scale_e8_layer
 
         return Q, scale_all, zero_all, Losses
 
