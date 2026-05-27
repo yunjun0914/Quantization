@@ -174,9 +174,11 @@ class RotatedGPTQ:
                 col_rot = self._apply_U(col.unsqueeze(1))  # (d_row, 1)
 
                 if use_e8vq:
-                    # per-layer scalar scale (모든 block, column 공유)
-                    scale_e8_col = scale_e8_layer.expand(self.d_row // 8, 1)
-                    scale_matrix_e8[:, j_global] = scale_e8_layer.item()
+                    # per-block scale 수집 (오차 전파 반영)
+                    scale_e8_col = (col_rot.reshape(-1, 8)
+                                    .norm(dim=1, keepdim=True) / (8**0.5) * 0.9
+                                    ).clamp(min=1e-8).float()
+                    scale_matrix_e8[:, j_global] = scale_e8_col.squeeze(1)
                     q_rot = quantize_e8(col_rot,
                                         scale_e8_col.to(col_rot.dtype))  # (d_row, 1)
                 elif use_2dvq:
@@ -236,6 +238,18 @@ class RotatedGPTQ:
 
             self.e8p_scale_u = a.to(self.dtype)                # (d_row//8,)
             self.e8p_scale_v = b.to(self.dtype)                # (d_col,)
+
+            # rank-1 scale로 Q를 재양자화
+            # S_hat[k, j] = a[k] * b[j]
+            print(f"  [E8P rank-1] re-quantizing with rank-1 scale...")
+            W_orig = self.layer.weight.data.clone().float() @ self.V.float().T
+            W_rot_r1 = self._apply_U(W_orig.to(W.device))
+            Q_r1 = torch.zeros_like(W_rot_r1)
+            for j in range(self.d_col):
+                col_r = W_rot_r1[:, j]
+                sc_r1 = (a * b[j]).unsqueeze(1).to(col_r.dtype)  # (d_row//8, 1)
+                Q_r1[:, j] = quantize_e8(col_r.unsqueeze(1), sc_r1).squeeze(1)
+            Q = self._apply_Ut(Q_r1).to(self.dtype)
 
         return Q, scale_all, zero_all, Losses
 
