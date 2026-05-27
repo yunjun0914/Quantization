@@ -46,7 +46,7 @@ def llama_rot_sequential_v2(
     model, dataloader, dev,
     bits=4, blocksize=128, percdamp=0.01,
     groupsize=-1, sym=False, actorder=False,
-    rot_mode="hadamard", seed=0, use_u=True, v1_mode=False, use_2d_vq=False, use_e8=False,
+    rot_mode="hadamard", seed=0, use_u=True, v1_mode=False, use_e8=False,
 ):
     print(f"[LLaMA RotatedGPTQ v2] bits={bits}  blocksize={blocksize}  rot={rot_mode}")
     model.eval()
@@ -114,7 +114,7 @@ def llama_rot_sequential_v2(
         # v1_mode=True: V1 방식 (회전 오차 포함 전파)
         # v1_mode=False: our method (순수 양자화 오차만 전파)
         handlers = {
-            name: RotatedGPTQ(lin, *rotations[name], restore_u=(not v1_mode), use_2d_vq=use_2d_vq, use_e8=use_e8)
+            name: RotatedGPTQ(lin, *rotations[name], restore_u=(not v1_mode), use_e8=use_e8)
             for name, lin in linears.items() if name in rotations
         }
 
@@ -230,7 +230,7 @@ def run_llama_rot_v2(
     model_name="meta-llama/Llama-2-7b-hf", bits=4, dataset="wikitext2",
     nsamples=128, seqlen=2048, seed=0, blocksize=128, percdamp=0.01,
     groupsize=-1, sym=False, actorder=False, rot_mode="hadamard",
-    dev="cuda:0", eval_before=True, use_u=True, v1_mode=False, use_2d_vq=False, use_e8=False,
+    dev="cuda:0", eval_before=True, use_u=True, v1_mode=False, use_e8=False,
 ):
     print(f"Loading model: {model_name}")
     model = LlamaForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16)
@@ -250,7 +250,7 @@ def run_llama_rot_v2(
         model, trainloader, dev,
         bits=bits, blocksize=blocksize, percdamp=percdamp,
         groupsize=groupsize, sym=sym, actorder=actorder,
-        rot_mode=rot_mode, seed=seed, use_u=use_u, v1_mode=v1_mode, use_2d_vq=use_2d_vq, use_e8=use_e8,
+        rot_mode=rot_mode, seed=seed, use_u=use_u, v1_mode=v1_mode, use_e8=use_e8,
     )
     print(f"\n[RotatedGPTQ v2] Total time: {time.time()-t0:.1f}s")
 

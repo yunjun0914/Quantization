@@ -16,12 +16,12 @@ Rotated GPTQ Core v2
 import math
 import torch
 import torch.nn as nn
-from quantize import quantize, find_params, quantize_nf, find_params_nf, NF2_GRID, get_nf_grid, quantize_2d_vq, find_scale_2d, get_codebook_2d, quantize_e8, find_scale_e8, get_e8p_codebook, _quantize_e8_batch, quantize_e8_colwise, find_scale_e8_colwise
+from quantize import quantize, find_params, quantize_nf, find_params_nf, NF2_GRID, get_nf_grid, quantize_e8, find_scale_e8, get_e8p_codebook
 
 
 class RotatedGPTQ:
 
-    def __init__(self, layer: nn.Linear, U: torch.Tensor, V: torch.Tensor, restore_u: bool = True, use_2d_vq: bool = False, use_e8: bool = False):
+    def __init__(self, layer: nn.Linear, U: torch.Tensor, V: torch.Tensor, restore_u: bool = True, use_e8: bool = False):
         self.layer = layer
         self.dev   = layer.weight.device
         self.dtype = layer.weight.dtype
@@ -31,7 +31,6 @@ class RotatedGPTQ:
 
         self.U = U.to(self.dev).float() if U is not None else None
         self.restore_u = restore_u
-        self.use_2d_vq  = use_2d_vq
         self.use_e8     = use_e8  # U=None이어도 E8 적용 가능
         self.V = V.to(self.dev).float()
 
@@ -103,14 +102,8 @@ class RotatedGPTQ:
 
         nf_grid  = get_nf_grid(bits)   # 2→NF2, 3→NF8, 4→NF16, else None
         use_nf   = nf_grid is not None
-        use_2dvq = self.use_2d_vq and (bits == 2) and (self.d_row % 2 == 0)
         use_e8vq = self.use_e8    and (bits == 2) and (self.d_row % 8 == 0)
 
-        # 2D VQ: per-pair scale 미리 계산
-        if use_2dvq:
-            codebook_2d = get_codebook_2d(self.dev)
-            W_rot_all   = self._apply_U(W)
-            scale_2d    = find_scale_2d(W_rot_all)  # (d_row//2, 1)
 
         # E8P per-layer scalar scale (QuIP# 방식)
         if use_e8vq:
@@ -173,9 +166,6 @@ class RotatedGPTQ:
                     scale_e8_col = scale_e8_layer.expand(self.d_row // 8, 1)
                     q_rot = quantize_e8(col_rot,
                                         scale_e8_col.to(col_rot.dtype))  # (d_row, 1)
-                elif use_2dvq:
-                    # 2D cross-row vector quantization
-                    q_rot = quantize_2d_vq(col_rot, scale_2d, codebook_2d)  # (d_row, 1)
                 elif use_nf:
                     q_rot = quantize_nf(col_rot, scale, nf_grid)
                 else:

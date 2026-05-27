@@ -15,84 +15,9 @@ import torch.nn as nn
 
 # NF grids (Gaussian quantile 기반, [-1, 1] 정규화)
 NF2_GRID  = torch.tensor([-1.0, -0.2770, 0.2770, 1.0], dtype=torch.float32)
-NF8_GRID  = torch.tensor([-1.0, -0.5783, -0.3186, -0.1025, 0.1025, 0.3186, 0.5783, 1.0], dtype=torch.float32)
-NF16_GRID = torch.tensor([-1.0, -0.7076, -0.5422, -0.4168, -0.3109, -0.2159, -0.1273, -0.0421,
-                            0.0421,  0.1273,  0.2159,  0.3109,  0.4168,  0.5422,  0.7076,  1.0], dtype=torch.float32)
 
 # 2D cross-row Vector Quantization codebook (Gaussian-optimal, 16 centers = 2bit/weight)
 # 미리 계산된 codebook (모듈 로드 시 한 번만)
-_CODEBOOK_2D_DATA = torch.tensor([
-    [ 1.8768, -0.2440], [ 0.0240, -0.0116], [ 1.7147,  1.0772], [-0.7371, -0.4963],
-    [ 1.2226, -1.4278], [-1.8262, -0.3406], [-1.1431, -1.4695], [ 0.5959,  1.7583],
-    [ 0.0635, -0.9517], [ 0.8230, -0.4106], [ 0.8337,  0.5137], [-0.0190,  0.8710],
-    [-0.7123,  1.6927], [-0.8336,  0.4270], [ 0.0342, -1.9977], [-1.7693,  0.9513],
-], dtype=torch.float32)
-
-def get_codebook_2d(device='cpu') -> torch.Tensor:
-    """Gaussian-optimal 2D codebook (16 centers, 2bit/weight) - 미리 계산됨"""
-    return _CODEBOOK_2D_DATA.to(device)
-
-
-def quantize_2d_vq(x: torch.Tensor, scale: torch.Tensor, codebook: torch.Tensor) -> torch.Tensor:
-    """
-    2D cross-row vector quantization.
-    x:        (d_row, 1) - 하나의 column (d_row개 원소)
-    scale:    (d_row//2, 1) - 2개 row 쌍마다 scale
-    codebook: (16, 2) - 2D codebook
-
-    Returns: (d_row, 1) quantized
-    """
-    d_row = x.shape[0]
-    assert d_row % 2 == 0, "d_row must be even for 2D VQ"
-
-    x_pairs = x.reshape(-1, 2).float()          # (d_row//2, 2)
-    x_norm  = x_pairs / scale.clamp(min=1e-8)   # normalize
-
-    # nearest neighbor
-    cb = codebook.to(x.device)                  # (16, 2)
-    dists = (x_norm.unsqueeze(1) - cb.unsqueeze(0)).pow(2).sum(-1)  # (d_row//2, 16)
-    idx   = dists.argmin(dim=1)                 # (d_row//2,)
-    x_q   = cb[idx] * scale                     # (d_row//2, 2)
-
-    return x_q.reshape(-1, 1)                   # (d_row, 1)
-
-
-def find_scale_2d(x: torch.Tensor, codebook: torch.Tensor = None) -> torch.Tensor:
-    """
-    2D VQ용 per-pair MSE clipping scale 계산.
-    pair × 전체 column 기준 k search → optimal scale.
-    x: (d_row, d_col) UWV^T 공간
-    Returns: scale (d_row//2, 1)
-    """
-    if codebook is None:
-        codebook = get_codebook_2d(x.device)
-
-    x_pairs = x.float().reshape(-1, 2, x.shape[1])        # (d_row//2, 2, d_col)
-    x_flat  = x_pairs.reshape(x_pairs.shape[0], -1)        # (d_row//2, 2*d_col)
-    std     = x_flat.std(dim=1, keepdim=True).clamp(min=1e-8)
-    cb      = codebook.to(x.device)
-
-    best_scale = std * 2.0
-    best_mse   = torch.full((x_flat.shape[0], 1), float('inf'), device=x.device)
-
-    x_2d = x_flat.reshape(x_flat.shape[0], -1, 2)          # (d_row//2, d_col, 2)
-    for k in [1.5, 1.8, 2.0, 2.2, 2.5, 3.0]:
-        scale_cand = std * k                                 # (d_row//2, 1)
-        x_norm = (x_2d / scale_cand.unsqueeze(1)).clamp(-3, 3)
-        mse_sum = torch.zeros(x_flat.shape[0], device=x.device)
-        chunk = 512
-        for c in range(0, x_2d.shape[1], chunk):
-            xc    = x_norm[:, c:c+chunk, :]
-            dists = (xc.unsqueeze(-2) - cb.unsqueeze(0).unsqueeze(0)).pow(2).sum(-1)
-            idx   = dists.argmin(dim=-1)
-            xc_q  = cb[idx] * scale_cand.unsqueeze(1)
-            mse_sum += (x_2d[:, c:c+chunk, :] - xc_q).pow(2).sum(dim=(1,2))
-        mse = (mse_sum / (x_2d.shape[1] * 2)).unsqueeze(1)
-        better     = mse < best_mse
-        best_scale = torch.where(better, scale_cand, best_scale)
-        best_mse   = torch.where(better, mse, best_mse)
-
-    return best_scale  # (d_row//2, 1)
 
 # E8P codebook (QuIP# 방식, 65536개 = 정확히 2bit/weight)
 import os as _os
@@ -225,83 +150,6 @@ def quantize_e8(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return (q_norm * scale).reshape(-1, 1)
 
 
-def _quantize_e8_batch(W_rot: torch.Tensor, scale_e8: torch.Tensor) -> torch.Tensor:
-    """
-    E8P batch quantization: W_rot 전체 block을 row-block 단위로 처리.
-    W_rot:    (d_row, count) - U @ W block
-    scale_e8: (d_row//8, 1)
-    Returns:  (d_row, count) quantized
-    """
-    cb = get_e8p_codebook(W_rot.device)
-    d_row, count = W_rot.shape
-    n_blocks = d_row // 8
-
-    # (n_blocks, 8, count) → (n_blocks, count, 8)
-    W_blocks = W_rot.float().reshape(n_blocks, 8, count).permute(0, 2, 1)  # (n_blocks, count, 8)
-    W_norm   = W_blocks / scale_e8.unsqueeze(1).clamp(min=1e-8)            # (n_blocks, count, 8)
-
-    Q_blocks = torch.zeros_like(W_norm)
-
-    # row-block 단위로 처리 (메모리 절약)
-    # GPU: 한 block(count, 8) vs 65536 → (count, 65536)
-    def nearest_part(xn):
-        # xn: (count, 8)
-        if xn.device.type == 'cuda':
-            dists = (xn.unsqueeze(1) - cb.unsqueeze(0)).pow(2).sum(-1)  # (count, 65536)
-            idx   = dists.argmin(dim=1)
-            return cb[idx], dists.min(dim=1).values
-        else:
-            best_idx  = torch.zeros(len(xn), dtype=torch.long, device=xn.device)
-            best_dist = torch.full((len(xn),), float('inf'), device=xn.device)
-            for c in range(0, len(cb), 2048):
-                dists = (xn.unsqueeze(1) - cb[c:c+2048].unsqueeze(0)).pow(2).sum(-1)
-                md, mi = dists.min(dim=1)
-                better = md < best_dist
-                best_dist[better] = md[better]
-                best_idx[better]  = mi[better] + c
-            return cb[best_idx], best_dist
-
-    for b in range(n_blocks):
-        xn = W_norm[b]                              # (count, 8)
-        pv, pe = nearest_part(xn + 0.25)
-        mv, me = nearest_part(xn - 0.25)
-        which  = pe < me
-        Q_blocks[b] = torch.where(which.unsqueeze(1), pv - 0.25, mv + 0.25)
-
-    # scale 복원: (n_blocks, count, 8) * (n_blocks, 1, 1)
-    Q_scaled = Q_blocks * scale_e8.unsqueeze(1).clamp(min=1e-8)  # (n_blocks, count, 8)
-
-    # → (d_row, count)
-    return Q_scaled.permute(0, 2, 1).reshape(d_row, count).to(W_rot.dtype)
-
-
-def quantize_e8_colwise(W_rot: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """
-    QuIP# Block LDLQ 방식: 8개 column을 묶어서 E8P quantization.
-    W_rot: (d_row, 8) - WV^T 공간의 8개 column
-    scale: (d_row, 1) - per-row scale
-    Returns: (d_row, 8) quantized
-    """
-    # (d_row, 8) → row별로 E8P nearest
-    x_norm = W_rot.float() / scale.clamp(min=1e-8)  # (d_row, 8)
-
-    pv, pe = _e8p_fast_qpart(x_norm + 0.25)
-    mv, me = _e8p_fast_qpart(x_norm - 0.25)
-    which  = (pe < me).unsqueeze(1)
-    q_norm = torch.where(which, pv - 0.25, mv + 0.25)
-    return (q_norm * scale).to(W_rot.dtype)          # (d_row, 8)
-
-
-def find_scale_e8_colwise(W_rot: torch.Tensor) -> torch.Tensor:
-    """
-    Column-wise E8P scale: per-row absmax 기반.
-    W_rot: (d_row, 8)
-    Returns: (d_row, 1)
-    """
-    std = W_rot.float().norm(dim=1, keepdim=True) / (8**0.5)
-    return (std * 0.9).clamp(min=1e-8)
-
-
 def find_scale_e8(W: torch.Tensor) -> torch.Tensor:
     """
     E8P scale 계산 (QuIP# scale_override=0.9 방식).
@@ -320,11 +168,6 @@ def get_nf_grid(bits: int) -> torch.Tensor:
     if bits == 3: return NF8_GRID
     if bits == 4: return NF16_GRID
     return None
-NF4_GRID = torch.tensor([
-    -1.0, -0.6962, -0.5251, -0.3949, -0.2767, -0.1691, -0.0626,
-     0.0626,  0.1691,  0.2767,  0.3949,  0.5251,  0.6962,  1.0,
-    -0.6962, -0.5251  # padding to 16
-], dtype=torch.float32)
 
 
 def quantize_nf(x: torch.Tensor, scale: torch.Tensor, nf_grid: torch.Tensor) -> torch.Tensor:
