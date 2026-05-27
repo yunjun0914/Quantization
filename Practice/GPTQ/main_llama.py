@@ -37,6 +37,7 @@ def parse_args():
     p.add_argument("--e8",         action="store_true", help="E8 lattice quantization (8D cross-row)")
     p.add_argument("--dev",       type=str,   default="cuda:0")
     p.add_argument("--compare",   action="store_true", help="기존 GPTQ와 PPL 비교")
+    p.add_argument("--export",    action="store_true", help="real quant E8P index 저장 + PPL 측정")
     return p.parse_args()
 
 
@@ -70,6 +71,7 @@ if __name__ == "__main__":
             use_u       = not args.no_u,
             v1_mode     = args.v1_mode,
             use_e8      = args.e8,
+            export      = args.export,
         )
 
         if args.compare:
@@ -117,6 +119,7 @@ if __name__ == "__main__":
             use_u       = not args.no_u,
             v1_mode     = args.v1_mode,
             use_e8      = args.e8,
+            export      = args.export,
         )
         print("\n" + "=" * 60)
         print(f"  FP16 baseline : {out['ppl_fp16']:.2f}")

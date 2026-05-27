@@ -16,7 +16,7 @@ Rotated GPTQ Core v2
 import math
 import torch
 import torch.nn as nn
-from quantize import quantize, find_params, quantize_nf, find_params_nf, NF2_GRID, get_nf_grid, quantize_e8, find_scale_e8, get_e8p_codebook
+from quantize import quantize, find_params, quantize_nf, find_params_nf, NF2_GRID, get_nf_grid, quantize_e8, quantize_e8_indexed, find_scale_e8, get_e8p_codebook
 
 
 class RotatedGPTQ:
@@ -202,6 +202,18 @@ class RotatedGPTQ:
         zero_all  = zero_all.to(self.dtype)
 
 
+
+        # export 모드: E8P index 저장
+        if use_e8vq and getattr(self, 'export_mode', False):
+            n_blocks = self.d_row // 8
+            idx_all  = torch.zeros(n_blocks, self.d_col, dtype=torch.int32)
+            for i in range(self.d_col):
+                col     = Q[:, i:i+1].float()
+                col_rot = self._apply_U(col)
+                _, idx  = quantize_e8_indexed(col_rot, scale_e8_layer.expand(n_blocks,1))
+                idx_all[:, i] = idx
+            self.e8p_idx   = idx_all          # (d_row//8, d_col) int32
+            self.e8p_scale = scale_e8_layer   # scalar
 
         return Q, scale_all, zero_all, Losses
 

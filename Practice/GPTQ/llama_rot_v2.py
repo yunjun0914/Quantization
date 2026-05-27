@@ -151,15 +151,25 @@ def llama_rot_sequential_v2(
         Q_dict = {}
         for name, handler in handlers.items():
             print(f"  quantizing {name:30s} ... ", end="", flush=True)
+            if export and use_e8:
+                handler.export_mode = True
             Q, scale, zero, loss = handler.quantize(
                 bits=bits, blocksize=blocksize, percdamp=percdamp,
                 groupsize=groupsize, sym=sym, actorder=actorder,
             )
             Q_dict[name] = Q
-            results[f"layer{layer_idx}.{name}"] = {
+            res_entry = {
                 "Q": Q.cpu(), "scale": scale.cpu(), "zero": zero.cpu(),
                 "loss": loss.mean().item(),
             }
+            # export 모드: E8P index + V 저장
+            if export and use_e8 and hasattr(handler, 'e8p_idx'):
+                res_entry['e8p_idx']   = handler.e8p_idx.cpu()
+                res_entry['e8p_scale'] = handler.e8p_scale.cpu()
+                res_entry['U']         = handler.U.cpu() if handler.U is not None else None
+                _, Vr = rotations[name]
+                res_entry['V']         = Vr.cpu() if Vr is not None else None
+            results[f"layer{layer_idx}.{name}"] = res_entry
             print(f"loss={loss.mean().item():.6f}")
             handler.free()
 
@@ -231,6 +241,7 @@ def run_llama_rot_v2(
     nsamples=128, seqlen=2048, seed=0, blocksize=128, percdamp=0.01,
     groupsize=-1, sym=False, actorder=False, rot_mode="hadamard",
     dev="cuda:0", eval_before=True, use_u=True, v1_mode=False, use_e8=False,
+    export=False,
 ):
     print(f"Loading model: {model_name}")
     model = LlamaForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16)
@@ -255,6 +266,7 @@ def run_llama_rot_v2(
     print(f"\n[RotatedGPTQ v2] Total time: {time.time()-t0:.1f}s")
 
     # R4 online: 모든 layer down_proj 앞에 U_gu hook 등록
+    # export 모드에서도 동일하게 적용 (E8PLinear의 V가 down_proj input을 처리)
     U_gu_cpu = U_gu.cpu()
     r4_hooks = []
     for layer in get_llama_layers(model):
@@ -280,4 +292,26 @@ def run_llama_rot_v2(
     for h in r4_hooks:
         h.remove()
 
-    return {"ppl_fp16": ppl_fp16, "ppl_quant": ppl_q, "results": results}
+    # export 모드: E8P handler에서 index 수집 → real quant PPL
+    ppl_real = None
+    if export and use_e8:
+        print("\n[Real Quant] E8P index 기반 PPL 측정 중...")
+        from llama_e8p_inference import E8PLinear, build_e8p_model
+        model_real = LlamaForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16)
+        quantized_layers = {}
+        for layer_name, res in results.items():
+            if 'e8p_idx' in res:
+                quantized_layers[layer_name] = {
+                    'idx':   res['e8p_idx'],
+                    'scale': res['e8p_scale'],
+                    'U':     res['U'],
+                    'V':     res.get('V', None),
+                }
+        if quantized_layers:
+            model_real = build_e8p_model(model_real, quantized_layers, {})
+            model_real = model_real.to(dev)
+            ppl_real = eval_ppl(model_real, testenc, dev, seqlen)
+            print(f"[Real Quant E8P] PPL = {ppl_real:.2f}")
+            del model_real
+
+    return {"ppl_fp16": ppl_fp16, "ppl_quant": ppl_q, "ppl_real": ppl_real, "results": results}
