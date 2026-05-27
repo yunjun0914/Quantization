@@ -160,7 +160,8 @@ def llama_rot_sequential_v2(
             )
             Q_dict[name] = Q
             res_entry = {
-                "Q": Q.cpu(), "scale": scale.cpu(), "zero": zero.cpu(),
+                "Q": None if export else Q.cpu(),  # export 모드: Q CPU 저장 안 함
+                "scale": scale.cpu(), "zero": zero.cpu(),
                 "loss": loss.mean().item(),
             }
             # export 모드: E8P index + V 저장
@@ -176,14 +177,15 @@ def llama_rot_sequential_v2(
 
         # ── Step 4: V 흡수 (Q @ V) ───────────────────────────────────────
         # down_proj: R4(U_gu)는 online → Q만 저장 (@ U_gu 안 함)
-        # 나머지: Q @ V 저장
+        # Q @ V: weight 복원 (next layer input 계산을 위해 항상 필요)
+        # export 모드에서도 forward pass에 사용 후 GPU에만 유지 (CPU 저장 안 함)
         for name, lin in linears.items():
-            if name not in Q_dict: continue
-            _, Vr = rotations[name]
-            if name == "mlp.down_proj":
-                lin.weight.data = Q_dict[name]  # Q(W_down @ U_gu^T) 그대로
-            else:
-                lin.weight.data = (Q_dict[name].float() @ Vr.float()).to(dtype)
+                if name not in Q_dict: continue
+                _, Vr = rotations[name]
+                if name == "mlp.down_proj":
+                    lin.weight.data = Q_dict[name]
+                else:
+                    lin.weight.data = (Q_dict[name].float() @ Vr.float()).to(dtype)
 
         # Step 5 불필요: inner loop q = U^T @ Q(U @ WV^T) 이미 복원
         # Step 4: Q @ V = U^T @ Q(U @ WV^T) @ V → inference x만 넣으면 ≈ Wx
@@ -220,7 +222,7 @@ def llama_rot_sequential_v2(
         print(f"  ↳ done in {time.time()-t0:.1f}s")
 
     model.config.use_cache = use_cache
-    return results, U_gu
+    return results, U_gu, V
 
 
 @torch.no_grad()
@@ -258,7 +260,7 @@ def run_llama_rot_v2(
         model = model.cpu()
 
     t0      = time.time()
-    results, U_gu = llama_rot_sequential_v2(
+    results, U_gu, V = llama_rot_sequential_v2(
         model, trainloader, dev,
         bits=bits, blocksize=blocksize, percdamp=percdamp,
         groupsize=groupsize, sym=sym, actorder=actorder,
@@ -288,8 +290,12 @@ def run_llama_rot_v2(
             )
 
     model   = model.to(dev)
-    ppl_q   = eval_ppl(model, testenc, dev, seqlen)
-    print(f"[{bits}bit RotatedGPTQ v2] PPL = {ppl_q:.2f}")
+    if not export:
+        ppl_q = eval_ppl(model, testenc, dev, seqlen)
+        print(f"[{bits}bit RotatedGPTQ v2] PPL = {ppl_q:.2f}")
+    else:
+        ppl_q = None
+        print(f"[Export mode] fake quant PPL 생략")
 
     for h in r4_hooks:
         h.remove()
@@ -299,6 +305,12 @@ def run_llama_rot_v2(
     if export and use_e8:
         print("\n[Real Quant] E8P index 기반 PPL 측정 중...")
         from llama_e8p_inference import E8PLinear, build_e8p_model
+
+        # 기존 fake quant 모델 먼저 삭제 (메모리 확보)
+        model = model.cpu()
+        del model
+        torch.cuda.empty_cache()
+
         model_real = LlamaForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16)
         quantized_layers = {}
         for layer_name, res in results.items():
@@ -310,10 +322,28 @@ def run_llama_rot_v2(
                     'V':     res.get('V', None),
                 }
         if quantized_layers:
-            model_real = build_e8p_model(model_real, quantized_layers, {})
+            model_real, r4_hooks_real = build_e8p_model(model_real, quantized_layers, V)
             model_real = model_real.to(dev)
+            # R4 hook: down_proj 앞에 U_gu online 적용 (E8PLinear.forward의 U^T와 별도)
+            from had_utils import matmul_hadU
+            U_gu_cpu = U_gu.cpu()
+            for layer in get_llama_layers(model_real):
+                linears = find_linear_layers(layer)
+                if "mlp.down_proj" in linears:
+                    def make_r4(U):
+                        def hook(m, inp):
+                            x = inp[0].float()
+                            shape = x.shape
+                            x = matmul_hadU(x.reshape(-1, x.shape[-1])).reshape(shape)
+                            return (x.to(inp[0].dtype),)
+                        return hook
+                    r4_hooks_real.append(
+                        linears["mlp.down_proj"].register_forward_pre_hook(make_r4(U_gu_cpu))
+                    )
             ppl_real = eval_ppl(model_real, testenc, dev, seqlen)
             print(f"[Real Quant E8P] PPL = {ppl_real:.2f}")
+            for h in r4_hooks_real: h.remove()
             del model_real
+            torch.cuda.empty_cache()
 
     return {"ppl_fp16": ppl_fp16, "ppl_quant": ppl_q, "ppl_real": ppl_real, "results": results}
