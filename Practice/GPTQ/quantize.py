@@ -150,6 +150,44 @@ def quantize_e8(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     return (q_norm * scale).reshape(-1, 1)
 
 
+def quantize_e8_indexed(x: torch.Tensor, scale: torch.Tensor):
+    """
+    E8P quantization with index.
+    x:     (d_row, 1)
+    scale: (d_row//8, 1)
+    Returns: (q_float, idx)
+      q_float: (d_row, 1) dequantized float
+      idx:     (d_row//8,) uint16 E8P codeword index
+    """
+    cb       = get_e8p_codebook(x.device)
+    x_blocks = x.reshape(-1, 8).float()
+    x_norm   = x_blocks / scale.clamp(min=1e-8)
+
+    pv, pe = _e8p_fast_qpart(x_norm + 0.25)
+    mv, me = _e8p_fast_qpart(x_norm - 0.25)
+    which  = (pe < me).unsqueeze(1)
+    q_norm = torch.where(which, pv - 0.25, mv + 0.25)
+
+    # nearest index in full codebook
+    dists  = (q_norm.unsqueeze(1) - cb.unsqueeze(0)).pow(2).sum(-1)
+    idx    = dists.argmin(dim=1).to(torch.int32)   # (d_row//8,)
+
+    q_float = (q_norm * scale).reshape(-1, 1)
+    return q_float, idx
+
+
+def dequantize_e8(idx: torch.Tensor, scale: torch.Tensor, device='cpu') -> torch.Tensor:
+    """
+    E8P dequantization from index.
+    idx:   (d_row//8,) int32
+    scale: scalar or (d_row//8, 1)
+    Returns: (d_row,) float
+    """
+    cb = get_e8p_codebook(device)
+    q  = cb[idx] * scale                    # (d_row//8, 8)
+    return q.reshape(-1)                    # (d_row,)
+
+
 def find_scale_e8(W: torch.Tensor) -> torch.Tensor:
     """
     E8P scale 계산 (QuIP# scale_override=0.9 방식).
@@ -165,8 +203,6 @@ def find_scale_e8(W: torch.Tensor) -> torch.Tensor:
 
 def get_nf_grid(bits: int) -> torch.Tensor:
     if bits == 2: return NF2_GRID
-    if bits == 3: return NF8_GRID
-    if bits == 4: return NF16_GRID
     return None
 
 
