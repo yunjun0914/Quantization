@@ -79,7 +79,13 @@ def get_hadamard(d: int, device="cpu", seed: int = 0) -> torch.Tensor:
             from had_utils import matmul_hadU
             # H_d를 명시적 행렬로 생성: H @ I
             eye = torch.eye(d, device=device)
-            return matmul_hadU(eye).T  # (d, d) Hadamard matrix
+            H = matmul_hadU(eye).T  # (d, d) Hadamard matrix
+            # randomize: diag(±1) @ H @ diag(±1) (QuIP# RHT 방식)
+            g = torch.Generator(device=device); g.manual_seed(seed)
+            dl = (torch.randint(0, 2, (d,), generator=g, device=device).float() * 2 - 1)
+            g.manual_seed(seed + 1)
+            dr = (torch.randint(0, 2, (d,), generator=g, device=device).float() * 2 - 1)
+            return dl.unsqueeze(1) * H * dr.unsqueeze(0)
         return get_random_orthogonal(d, seed=seed, device=device)
 
 def get_rotation(d: int, mode: str = "random", seed: int = 0, device="cpu") -> torch.Tensor:
