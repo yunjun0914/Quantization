@@ -165,9 +165,10 @@ class RotatedGPTQ:
                 col_rot = self._apply_U(col.unsqueeze(1))  # (d_row, 1)
 
                 if use_e8vq:
-                    # E8P: 128 E8P block (=1024 row)마다 scale 공유
-                    # bpw = 2 + 16/(8×128) ≈ 2.016bpw ✅
-                    G = 128  # E8P block groupsize
+                    # E8P: 16개 E8P block (=128 row)마다 scale 공유
+                    # GPTQ groupsize=128과 동일 granularity
+                    # bpw = 2 + 16/(16×8) = 2 + 0.125 = 2.125bpw
+                    G = 16  # 16개 E8P block = 128 row
                     n_blocks = self.d_row // 8
                     scale_e8_col = torch.zeros(n_blocks, 1,
                                                device=col_rot.device,
