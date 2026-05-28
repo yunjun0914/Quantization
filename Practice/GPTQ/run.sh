@@ -25,6 +25,6 @@ python -u main_llama.py \
     --rot hadamard \
     --v2 \
     --e8 \
-    --export \
+    --compare \
     --percdamp 0.01 \
     --dev cuda:0 
