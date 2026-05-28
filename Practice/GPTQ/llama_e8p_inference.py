@@ -48,7 +48,7 @@ class E8PLinear(nn.Module):
         return q
 
     def forward(self, x):
-        W   = self.dequant_weight()                  # (d_row, d_col) U 공간
+        W   = self.dequant_weight().to(x.dtype)      # (d_row, d_col) dtype 맞춤
         out = x @ W.t()                              # (*, d_row) U 공간
 
         # U^T online: FWHT (O(n log n))
