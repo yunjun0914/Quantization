@@ -32,7 +32,7 @@ class E8PLinear(nn.Module):
     """
     def __init__(self, d_row, d_col, idx, scale, U=None, V=None, bias=None):
         super().__init__()
-        self.register_buffer('idx',   idx.cpu())
+        self.register_buffer('idx',   idx.cpu().to(torch.int16))
         self.register_buffer('scale', scale.cpu())
         self.d_row = d_row
         self.d_col = d_col
@@ -49,7 +49,7 @@ class E8PLinear(nn.Module):
         E8P index → U^T @ Q_rot (fake quant의 Q와 동일)
         """
         cb = get_e8p_codebook(self.idx.device)
-        q  = cb[self.idx]                               # (d_row//8, d_col, 8)
+        q  = cb[self.idx.to(torch.int32)]              # int16 → int32 for indexing
         q  = q * self.scale
         q  = q.permute(0, 2, 1).reshape(self.d_row, self.d_col)  # U 공간
 
@@ -121,5 +121,18 @@ def build_e8p_model(model, quantized_layers, V, rotations=None):
         setattr(parent, sub_parts[-1], e8p_layer)
         mem_kb = d_row * d_col * 2 / 8 / 1024
         print(f"  replaced {full_name}: {d_row}×{d_col} → E8P ({mem_kb:.1f}KB)")
+
+    # 실제 저장 크기 출력
+    total_bytes = sum(
+        p.numel() * p.element_size()
+        for m in model.modules() if isinstance(m, E8PLinear)
+        for p in m.buffers()
+    )
+    print(f"  [Real Quant] 총 저장 크기: {total_bytes/1e9:.2f}GB")
+    idx_bytes = sum(
+        m.idx.numel() * m.idx.element_size()
+        for m in model.modules() if isinstance(m, E8PLinear)
+    )
+    print(f"  [Real Quant] idx (int16): {idx_bytes/1e9:.2f}GB = {idx_bytes*8/sum(m.idx.numel()*8 for m in model.modules() if isinstance(m, E8PLinear)):.2f}bpw")
 
     return model, hooks

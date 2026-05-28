@@ -34,6 +34,7 @@ def parse_args():
     p.add_argument("--v2",        action="store_true", help="RotatedGPTQ v2 (globally shared V & U)")
     p.add_argument("--no_u",      action="store_true", help="ablation: U rotation 제거")
     p.add_argument("--v1_mode",    action="store_true", help="ablation: V1 방식 (U^T 복원 없음, 회전 오차 포함)")
+    p.add_argument("--uwvt",        action="store_true", help="ablation: UWV^T 공간에서 직접 오차 전파")
     p.add_argument("--e8",         action="store_true", help="E8 lattice quantization (8D cross-row)")
     p.add_argument("--dev",       type=str,   default="cuda:0")
     p.add_argument("--compare",   action="store_true", help="기존 GPTQ와 PPL 비교")
@@ -70,6 +71,7 @@ if __name__ == "__main__":
             eval_before = True,
             use_u       = not args.no_u,
             v1_mode     = args.v1_mode,
+            uwvt_mode   = args.uwvt,
             use_e8      = args.e8,
             export      = args.export,
         )
@@ -118,6 +120,7 @@ if __name__ == "__main__":
             eval_before = True,
             use_u       = not args.no_u,
             v1_mode     = args.v1_mode,
+            uwvt_mode   = args.uwvt,
             use_e8      = args.e8,
             export      = args.export,
         )

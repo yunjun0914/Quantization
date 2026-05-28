@@ -61,6 +61,7 @@ class RotatedGPTQ:
         groupsize: int   = -1,
         sym:       bool  = False,
         actorder:  bool  = False,
+        uwvt_mode: bool  = False,  # UWV^T 공간에서 직접 오차 전파
     ):
         """
         W 공간 유지 + 매 column 양자화 시에만 U 회전.
@@ -69,6 +70,10 @@ class RotatedGPTQ:
         (rotate_weight에서 U@W@V^T로 회전하지 않고 W@V^T만 적용)
         """
         W = self.layer.weight.data.clone().float()   # (d_row, d_col) = WV^T
+
+        # UWV^T 모드: W를 UWV^T 공간으로 변환
+        if uwvt_mode and self.U is not None:
+            W = self._apply_U(W)   # UWV^T 공간
         H = self.H.float()                           # H̃ = VHV^T
 
         # ── dead weight ───────────────────────────────────────────────────
@@ -179,15 +184,20 @@ class RotatedGPTQ:
                 q_rot = q_rot.squeeze(1)
                 col_rot = col_rot.squeeze(1)
 
-                if self.restore_u:
-                    q = self._apply_Ut(q_rot.unsqueeze(1)).squeeze(1)
+                if uwvt_mode and self.U is not None:
+                    # UWV^T 공간에서 직접 오차 전파
+                    q   = q_rot
+                    err = (col_rot - q_rot) / d        # UWV^T 공간 오차
+                elif self.restore_u:
+                    q   = self._apply_Ut(q_rot.unsqueeze(1)).squeeze(1)
+                    err = (col - q) / d
                 else:
-                    q = q_rot
+                    q   = q_rot
+                    err = (col - q) / d
 
                 Q1[:, j_loc]    = q
 
-                # W 공간 순수 오차
-                err             = (col - q) / d       # (d_row,)
+                # 오차 전파
                 Loss1[:, j_loc] = err ** 2
 
                 # W 공간에서 전파, H̃^{-1} 그대로
