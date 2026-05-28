@@ -30,13 +30,14 @@ class E8PLinear(nn.Module):
     Real 2bit E8P quantized Linear layer.
     fake quant의 W_stored = U^T @ Q_rot (@ V) 와 동일.
     """
-    def __init__(self, d_row, d_col, idx, scale, U=None, bias=None):
+    def __init__(self, d_row, d_col, idx, scale, U=None, V=None, bias=None):
         super().__init__()
         self.register_buffer('idx',   idx.cpu())
         self.register_buffer('scale', scale.cpu())
         self.d_row = d_row
         self.d_col = d_col
         self.U     = U   # globally shared tensor 참조
+        self.V     = V   # globally shared tensor 참조
 
         if bias is not None:
             self.register_buffer('bias', bias.cpu())
@@ -52,10 +53,13 @@ class E8PLinear(nn.Module):
         q  = q * self.scale
         q  = q.permute(0, 2, 1).reshape(self.d_row, self.d_col)  # U 공간
 
-        # U^T 적용 (fake quant의 q = U^T @ q_rot 와 동일)
+        # U^T 적용
         if self.U is not None:
-            U = self.U.to(q.device).float()
-            q = U.t() @ q.float()
+            q = self.U.to(q.device).t().float() @ q.float()
+
+        # V 적용 → U^T @ Q_rot @ V = fake quant의 W_stored
+        if self.V is not None:
+            q = q.float() @ self.V.to(q.device).float()
 
         return q
 
@@ -68,21 +72,6 @@ class E8PLinear(nn.Module):
         return out
 
 
-def make_v_hook(V):
-    """LayerNorm output에 V rotation 적용.
-    fake quant: y = x @ (Q@V).t = x @ V.t @ Q.t
-    real quant: y = x_rot @ Q.t, x_rot = x @ V.t
-    따라서 x_rot = x @ V.t (= (V @ x.t).t)
-    """
-    def hook(module, input, output):
-        orig_shape = output.shape
-        out_flat   = output.reshape(-1, output.shape[-1]).float()
-        V_dev      = V.float().to(out_flat.device)
-        out_rot    = out_flat @ V_dev.t()   # x @ V.t (fake quant와 동일)
-        return out_rot.reshape(orig_shape).to(output.dtype)
-    return hook
-
-
 def build_e8p_model(model, quantized_layers, V, rotations=None):
     """
     fake quant 모델을 real quant E8PLinear로 교체.
@@ -92,11 +81,7 @@ def build_e8p_model(model, quantized_layers, V, rotations=None):
     layers = model.model.layers
     hooks  = []
 
-    # 1. LayerNorm output에 V hook, block output에 V^T hook 등록
-    for layer in layers:
-        # V: LayerNorm output → weight input 공간 변환
-        hooks.append(layer.input_layernorm.register_forward_hook(make_v_hook(V)))
-        hooks.append(layer.post_attention_layernorm.register_forward_hook(make_v_hook(V)))
+    hooks = []  # V hook 불필요 (dequant_weight에서 V 처리)
 
 
     # 2. Linear layer를 E8PLinear로 교체
@@ -119,12 +104,18 @@ def build_e8p_model(model, quantized_layers, V, rotations=None):
         if rotations and sub_name in rotations:
             U, _ = rotations[sub_name]
 
+        # V: rotations에서 가져오기 (down_proj는 V 대신 U_gu)
+        V_layer = None
+        if rotations and sub_name in rotations:
+            _, V_layer = rotations[sub_name]
+
         e8p_layer = E8PLinear(
             d_row = d_row,
             d_col = d_col,
             idx   = data['idx'],
             scale = data['scale'],
             U     = U,
+            V     = V_layer,
             bias  = orig.bias,
         )
         setattr(parent, sub_parts[-1], e8p_layer)
