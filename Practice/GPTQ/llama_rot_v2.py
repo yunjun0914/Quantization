@@ -219,7 +219,7 @@ def llama_rot_sequential_v2(
         print(f"  ↳ done in {time.time()-t0:.1f}s")
 
     model.config.use_cache = use_cache
-    return results, U_gu, V
+    return results, U_gu, V, rotations
 
 
 @torch.no_grad()
@@ -257,7 +257,7 @@ def run_llama_rot_v2(
         model = model.cpu()
 
     t0      = time.time()
-    results, U_gu, V = llama_rot_sequential_v2(
+    results, U_gu, V, rotations = llama_rot_sequential_v2(
         model, trainloader, dev,
         bits=bits, blocksize=blocksize, percdamp=percdamp,
         groupsize=groupsize, sym=sym, actorder=actorder,
@@ -317,24 +317,26 @@ def run_llama_rot_v2(
                     'scale': res['e8p_scale'],
                 }
         if quantized_layers:
-            model_real, r4_hooks_real = build_e8p_model(model_real, quantized_layers, V)
-            # U는 E8PLinear.forward에서 FWHT로 on-the-fly 적용 (globally shared)
+            # rotations: layer별 U 정보 전달
+            model_real, r4_hooks_real = build_e8p_model(
+                model_real, quantized_layers, V, rotations=rotations
+            )
             model_real = model_real.to(dev)
-            # R4 hook: down_proj 앞에 U_gu online 적용 (E8PLinear.forward의 U^T와 별도)
-            from had_utils import matmul_hadU
+            # R4 hook: down_proj input에 U_gu 적용 (fake quant와 동일)
             U_gu_cpu = U_gu.cpu()
             for layer in get_llama_layers(model_real):
                 linears = find_linear_layers(layer)
                 if "mlp.down_proj" in linears:
-                    def make_r4(U):
+                    def make_r4_hook(U_g):
                         def hook(m, inp):
-                            x = inp[0].float()
-                            shape = x.shape
-                            x = matmul_hadU(x.reshape(-1, x.shape[-1])).reshape(shape)
-                            return (x.to(inp[0].dtype),)
+                            x  = inp[0].float()
+                            sh = x.shape
+                            x  = (U_g.to(x.device).float() @ x.reshape(-1, sh[-1]).t()).t()
+                            return (x.reshape(sh).to(inp[0].dtype),)
                         return hook
                     r4_hooks_real.append(
-                        linears["mlp.down_proj"].register_forward_pre_hook(make_r4(U_gu_cpu))
+                        linears["mlp.down_proj"].register_forward_pre_hook(
+                            make_r4_hook(U_gu_cpu))
                     )
             ppl_real = eval_ppl(model_real, testenc, dev, seqlen)
             print(f"[Real Quant E8P] PPL = {ppl_real:.2f}")
