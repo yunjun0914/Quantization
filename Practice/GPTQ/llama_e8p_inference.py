@@ -83,6 +83,24 @@ def make_v_hook(V):
     return hook
 
 
+def make_vt_hook(V):
+    """block output에 V^T 적용 (residual 공간 복원)"""
+    def hook(module, input, output):
+        if isinstance(output, tuple):
+            out = output[0]
+        else:
+            out = output
+        orig_shape = out.shape
+        out_flat   = out.reshape(-1, out.shape[-1]).float()
+        V_dev      = V.float().to(out_flat.device)
+        out_vt     = out_flat @ V_dev   # x @ V^T (V가 orthogonal이라 V^T = V.t())
+        result     = out_vt.reshape(orig_shape).to(out.dtype)
+        if isinstance(output, tuple):
+            return (result,) + output[1:]
+        return result
+    return hook
+
+
 def build_e8p_model(model, quantized_layers, V, rotations=None):
     """
     fake quant 모델을 real quant E8PLinear로 교체.
@@ -92,10 +110,14 @@ def build_e8p_model(model, quantized_layers, V, rotations=None):
     layers = model.model.layers
     hooks  = []
 
-    # 1. LayerNorm에 V hook 등록 (q/k/v/o/gate/up input rotation)
+    # 1. LayerNorm output에 V hook, block output에 V^T hook 등록
     for layer in layers:
+        # V: LayerNorm output → weight input 공간 변환
         hooks.append(layer.input_layernorm.register_forward_hook(make_v_hook(V)))
         hooks.append(layer.post_attention_layernorm.register_forward_hook(make_v_hook(V)))
+        # V^T: block output → residual 공간 복원
+        hooks.append(layer.self_attn.register_forward_hook(make_vt_hook(V)))
+        hooks.append(layer.mlp.register_forward_hook(make_vt_hook(V)))
 
     # 2. Linear layer를 E8PLinear로 교체
     for full_name, data in quantized_layers.items():
