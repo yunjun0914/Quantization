@@ -112,13 +112,15 @@ class RotatedGPTQ:
 
         # E8P per-layer scalar scale (QuIP# 방식)
         if use_e8vq:
-            W_rot_all = self._apply_U(W)
+            # uwvt_mode: W가 이미 UWV^T → U 추가 불필요
+            W_rot_all = W if (uwvt_mode and self.U is not None) else self._apply_U(W)
             scale_e8_layer = (W_rot_all.square().mean().sqrt() / 0.9
                               ).clamp(min=1e-8).to(W.device)
             idx_col_list = []
 
         if groupsize <= 0:
-            W_rot_full = self._apply_U(W)
+            # uwvt_mode: W가 이미 UWV^T → U 추가 불필요
+            W_rot_full = W if (uwvt_mode and self.U is not None) else self._apply_U(W)
             if use_nf:
                 scale = find_params_nf(W_rot_full, perchannel=True, nf_grid=nf_grid)
                 zero  = torch.zeros_like(scale)
@@ -151,7 +153,7 @@ class RotatedGPTQ:
                 if groupsize > 0 and j_global % groupsize == 0:
                     g_idx = j_global // groupsize
                     g_end = min(j_global + groupsize, self.d_col)
-                    W_rot_g = self._apply_U(W[:, j_global:g_end])
+                    W_rot_g = W[:, j_global:g_end] if (uwvt_mode and self.U is not None) else self._apply_U(W[:, j_global:g_end])
                     if use_nf:
                         scale = find_params_nf(W_rot_g, perchannel=True, nf_grid=nf_grid)
                         zero  = torch.zeros_like(scale)
@@ -165,7 +167,11 @@ class RotatedGPTQ:
                     zero  = zero_all[:, 0:1]
 
                 # ── 핵심: 양자화 시에만 U 회전 ──────────────────────────
-                col_rot = self._apply_U(col.unsqueeze(1))  # (d_row, 1)
+                # uwvt_mode: W가 이미 UWV^T → U 추가 적용 없음
+                if uwvt_mode and self.U is not None:
+                    col_rot = col.unsqueeze(1)              # (d_row, 1) UWV^T 그대로
+                else:
+                    col_rot = self._apply_U(col.unsqueeze(1))  # (d_row, 1)
 
                 if use_e8vq:
                     # per-layer scalar scale
@@ -211,6 +217,10 @@ class RotatedGPTQ:
 
         if actorder:
             Q = Q[:, invperm]
+
+        # uwvt_mode: Q가 UWV^T 공간 → U^T 적용해서 WV^T 공간으로 복원
+        if uwvt_mode and self.U is not None:
+            Q = self._apply_Ut(Q)
 
         Q         = Q.to(self.dtype)
         scale_all = scale_all.to(self.dtype)
