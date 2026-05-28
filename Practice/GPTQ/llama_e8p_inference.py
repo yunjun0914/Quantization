@@ -27,14 +27,12 @@ class E8PLinear(nn.Module):
     V: LayerNorm에 흡수 → 여기서 불필요
     U: forward 시 FWHT on-the-fly
     """
-    def __init__(self, d_row, d_col, idx, scale, U_seed=None, U_size=None, bias=None):
+    def __init__(self, d_row, d_col, idx, scale, bias=None):
         super().__init__()
         self.register_buffer('idx',   idx.cpu())      # (d_row//8, d_col) int32
         self.register_buffer('scale', scale.cpu())    # scalar
         self.d_row   = d_row
         self.d_col   = d_col
-        self.U_seed  = U_seed   # rotation seed (재생성용)
-        self.U_size  = U_size   # rotation 크기
 
         if bias is not None:
             self.register_buffer('bias', bias.cpu())
@@ -123,11 +121,11 @@ def build_e8p_model(model, quantized_layers, V, seed=0):
 
         d_row, d_col = orig.weight.shape
         e8p_layer = E8PLinear(
-            d_row  = d_row,
-            d_col  = d_col,
-            idx    = data['idx'],
-            scale  = data['scale'],
-            bias   = orig.bias,
+            d_row = d_row,
+            d_col = d_col,
+            idx   = data['idx'],
+            scale = data['scale'],
+            bias  = orig.bias,
         )
         setattr(parent, sub_parts[-1], e8p_layer)
         mem_kb = d_row * d_col * 2 / 8 / 1024

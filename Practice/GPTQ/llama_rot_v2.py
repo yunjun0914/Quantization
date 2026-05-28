@@ -164,13 +164,10 @@ def llama_rot_sequential_v2(
                 "scale": scale.cpu(), "zero": zero.cpu(),
                 "loss": loss.mean().item(),
             }
-            # export 모드: E8P index + V 저장
+            # export 모드: E8P index만 저장 (U, V는 globally shared → 별도 전달)
             if export and use_e8 and hasattr(handler, 'e8p_idx'):
                 res_entry['e8p_idx']   = handler.e8p_idx.cpu()
                 res_entry['e8p_scale'] = handler.e8p_scale.cpu()
-                res_entry['U']         = handler.U.cpu() if handler.U is not None else None
-                _, Vr = rotations[name]
-                res_entry['V']         = Vr.cpu() if Vr is not None else None
             results[f"layer{layer_idx}.{name}"] = res_entry
             print(f"loss={loss.mean().item():.6f}")
             handler.free()
@@ -318,11 +315,10 @@ def run_llama_rot_v2(
                 quantized_layers[layer_name] = {
                     'idx':   res['e8p_idx'],
                     'scale': res['e8p_scale'],
-                    'U':     res['U'],
-                    'V':     res.get('V', None),
                 }
         if quantized_layers:
             model_real, r4_hooks_real = build_e8p_model(model_real, quantized_layers, V)
+            # U는 E8PLinear.forward에서 FWHT로 on-the-fly 적용 (globally shared)
             model_real = model_real.to(dev)
             # R4 hook: down_proj 앞에 U_gu online 적용 (E8PLinear.forward의 U^T와 별도)
             from had_utils import matmul_hadU
