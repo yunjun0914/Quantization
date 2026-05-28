@@ -63,19 +63,22 @@ def llama_rot_sequential_v2(
 
     # ── Global V, U (한 번만 생성) ────────────────────────────────────────
     V    = get_rotation(hidden, mode=rot_mode, seed=seed,   device=device)  # R1
+    U_qk = get_rotation(hidden, mode=rot_mode, seed=seed+1, device=device)  # R3
+    U_v  = get_rotation(hidden, mode=rot_mode, seed=seed+2, device=device)  # R2
+    U_gu = get_rotation(inter,  mode=rot_mode, seed=seed+3, device=device)  # R4
+    U_d  = get_rotation(hidden, mode=rot_mode, seed=seed+4, device=device)  # R5
     if block_u:
-        # I ⊗ U_8: E8P block-aligned local Gaussianization
-        U_8  = get_rotation(8, mode=rot_mode, seed=seed+1, device=device)   # globally shared 8×8
-        U_qk = get_block_rotation(hidden, block_size=8, mode=rot_mode, seed=seed+1, device=device)
-        U_v  = get_block_rotation(hidden, block_size=8, mode=rot_mode, seed=seed+2, device=device)
-        U_gu = get_block_rotation(inter,  block_size=8, mode=rot_mode, seed=seed+3, device=device)
-        U_d  = get_block_rotation(hidden, block_size=8, mode=rot_mode, seed=seed+4, device=device)
-        print(f"  [block_u] U_8(8,8) × {hidden//8} blocks")
-    else:
-        U_qk = get_rotation(hidden, mode=rot_mode, seed=seed+1, device=device)  # R3
-        U_v  = get_rotation(hidden, mode=rot_mode, seed=seed+2, device=device)  # R2
-        U_gu = get_rotation(inter,  mode=rot_mode, seed=seed+3, device=device)  # R4
-        U_d  = get_rotation(hidden, mode=rot_mode, seed=seed+4, device=device)  # R5
+        # u @ U: full U로 outlier 분산 + block U_8로 8D Gaussianize
+        # uUWV^T - Q(uUWV^T) 꼴
+        u_qk = get_block_rotation(hidden, block_size=8, mode=rot_mode, seed=seed+5, device=device)
+        u_v  = get_block_rotation(hidden, block_size=8, mode=rot_mode, seed=seed+6, device=device)
+        u_gu = get_block_rotation(inter,  block_size=8, mode=rot_mode, seed=seed+7, device=device)
+        u_d  = get_block_rotation(hidden, block_size=8, mode=rot_mode, seed=seed+8, device=device)
+        U_qk = u_qk @ U_qk   # (I⊗U_8) @ U_had
+        U_v  = u_v  @ U_v
+        U_gu = u_gu @ U_gu
+        U_d  = u_d  @ U_d
+        print(f"  [block_u] u=(I⊗U_8) @ U_had")
 
     print(f"  V({hidden},{hidden})  U_qk({hidden},{hidden})  U_v({hidden},{hidden})")
     print(f"  U_gu({inter},{inter})  U_d({hidden},{hidden})")

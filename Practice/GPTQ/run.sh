@@ -26,6 +26,7 @@ python -u main_llama.py \
     --v2 \
     --e8 \
     --uwvt \
-    --export \
+    --block_u \
+    --compare \
     --percdamp 0.01 \
     --dev cuda:0 
