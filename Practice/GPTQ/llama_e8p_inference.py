@@ -30,12 +30,13 @@ class E8PLinear(nn.Module):
     Real 2bit E8P quantized Linear layer.
     fake quant의 W_stored = U^T @ Q_rot (@ V) 와 동일.
     """
-    def __init__(self, d_row, d_col, idx, scale, V=None, bias=None):
+    def __init__(self, d_row, d_col, idx, scale, U=None, V=None, bias=None):
         super().__init__()
         self.register_buffer('idx',   idx.cpu().to(torch.int16))
         self.register_buffer('scale', scale.cpu())
         self.d_row = d_row
         self.d_col = d_col
+        self.U     = U   # globally shared tensor 참조
         self.V     = V   # globally shared tensor 참조
 
         if bias is not None:
@@ -45,20 +46,25 @@ class E8PLinear(nn.Module):
 
     def dequant_weight(self):
         """
-        E8P index → Q_rot @ V (uwvt_mode 기준)
+        E8P index → U^T @ Q_rot @ V (fake quant의 W_stored와 동일)
 
         idx: UWV^T 공간에서 수집된 E8P index
         cb[idx] = Q_rot (UWV^T 공간)
-        @ V → UWV^T @ V 공간
+        U^T @ cb[idx] = WV^T 공간 (uwvt_mode에서 최종 Q = U^T @ Q_rot)
+        @ V → W 공간
 
-        inference: y = x @ (Q_rot @ V).t
+        fake quant W_stored = U^T @ Q_rot @ V 와 동일
         """
         cb = get_e8p_codebook(self.idx.device)
         q  = cb[self.idx.to(torch.int32)]              # (d_row//8, d_col, 8)
         q  = q * self.scale
         q  = q.permute(0, 2, 1).reshape(self.d_row, self.d_col)  # UWV^T 공간
 
-        # V 적용 → UWV^T @ V
+        # U^T 적용 → WV^T 공간 (fake quant의 U^T @ Q_rot)
+        if self.U is not None:
+            q = self.U.to(q.device).t().float() @ q.float()
+
+        # V 적용 → W 공간 (fake quant의 Q @ V)
         if self.V is not None:
             q = q.float() @ self.V.to(q.device).float()
 
@@ -100,16 +106,17 @@ def build_e8p_model(model, quantized_layers, V, rotations=None):
 
         d_row, d_col = orig.weight.shape
 
-        # V: rotations에서 가져오기 (down_proj는 V 대신 U_gu)
-        V_layer = None
+        # U, V: rotations에서 가져오기
+        U_layer, V_layer = None, None
         if rotations and sub_name in rotations:
-            _, V_layer = rotations[sub_name]
+            U_layer, V_layer = rotations[sub_name]
 
         e8p_layer = E8PLinear(
             d_row = d_row,
             d_col = d_col,
             idx   = data['idx'],
             scale = data['scale'],
+            U     = U_layer,
             V     = V_layer,
             bias  = orig.bias,
         )

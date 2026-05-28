@@ -174,10 +174,14 @@ def llama_rot_sequential_v2(
                 "scale": scale.cpu(), "zero": zero.cpu(),
                 "loss": loss.mean().item(),
             }
-            # export 모드: E8P index만 저장 (U, V는 globally shared → 별도 전달)
+            # export 모드: E8P index 저장
             if export and use_e8 and hasattr(handler, 'e8p_idx'):
                 res_entry['e8p_idx']   = handler.e8p_idx.cpu()
                 res_entry['e8p_scale'] = handler.e8p_scale.cpu()
+                # U, V: rotations에서 globally shared 참조
+                Ur, Vr = rotations[name]
+                res_entry['U'] = Ur.cpu() if Ur is not None else None
+                res_entry['V'] = Vr.cpu() if Vr is not None else None
             results[f"layer{layer_idx}.{name}"] = res_entry
             print(f"loss={loss.mean().item():.6f}")
             handler.free()
@@ -325,6 +329,8 @@ def run_llama_rot_v2(
                 quantized_layers[layer_name] = {
                     'idx':   res['e8p_idx'],
                     'scale': res['e8p_scale'],
+                    'U':     res.get('U', None),
+                    'V':     res.get('V', None),
                 }
         if quantized_layers:
             # rotations: layer별 U 정보 전달
