@@ -100,6 +100,26 @@ def get_rotation(d: int, mode: str = "random", seed: int = 0, device="cpu") -> t
         return get_random_orthogonal(d, seed=seed, device=device)
 
 
+
+def get_block_rotation(d_total: int, block_size: int = 8, mode: str = "hadamard", seed: int = 0, device="cpu") -> torch.Tensor:
+    """
+    I ⊗ U_8: block diagonal rotation matrix.
+    각 block_size × block_size 블록이 동일한 U_8로 구성.
+
+    저장: U_8 (8×8) 하나 = ~0bpw
+    효과: E8P block-aligned local Gaussianization
+
+    Args:
+        d_total: 전체 차원 (block_size의 배수여야 함)
+        block_size: E8P block size (기본값 8)
+    """
+    assert d_total % block_size == 0, f"d_total({d_total}) must be divisible by block_size({block_size})"
+    U_8 = get_rotation(block_size, mode=mode, seed=seed, device=device)  # (8, 8)
+    n_blocks = d_total // block_size
+    # block diagonal: I ⊗ U_8
+    U = torch.block_diag(*([U_8] * n_blocks))  # (d_total, d_total)
+    return U
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Absorption
 # ─────────────────────────────────────────────────────────────────────────────

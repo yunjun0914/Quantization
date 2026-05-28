@@ -28,7 +28,7 @@ import torch.nn as nn
 from transformers import LlamaForCausalLM
 
 from gptq_rot import RotatedGPTQ
-from rotation import get_rotation
+from rotation import get_rotation, get_block_rotation
 from data import get_loaders
 
 
@@ -46,7 +46,7 @@ def llama_rot_sequential_v2(
     model, dataloader, dev,
     bits=4, blocksize=128, percdamp=0.01,
     groupsize=-1, sym=False, actorder=False,
-    rot_mode="hadamard", seed=0, use_u=True, v1_mode=False, use_e8=False, uwvt_mode=False,
+    rot_mode="hadamard", seed=0, use_u=True, v1_mode=False, use_e8=False, uwvt_mode=False, block_u=False,
     export=False,
 ):
     print(f"[LLaMA RotatedGPTQ v2] bits={bits}  blocksize={blocksize}  rot={rot_mode}")
@@ -63,10 +63,19 @@ def llama_rot_sequential_v2(
 
     # ── Global V, U (한 번만 생성) ────────────────────────────────────────
     V    = get_rotation(hidden, mode=rot_mode, seed=seed,   device=device)  # R1
-    U_qk = get_rotation(hidden, mode=rot_mode, seed=seed+1, device=device)  # R3
-    U_v  = get_rotation(hidden, mode=rot_mode, seed=seed+2, device=device)  # R2
-    U_gu = get_rotation(inter,  mode=rot_mode, seed=seed+3, device=device)  # R4
-    U_d  = get_rotation(hidden, mode=rot_mode, seed=seed+4, device=device)  # R5
+    if block_u:
+        # I ⊗ U_8: E8P block-aligned local Gaussianization
+        U_8  = get_rotation(8, mode=rot_mode, seed=seed+1, device=device)   # globally shared 8×8
+        U_qk = get_block_rotation(hidden, block_size=8, mode=rot_mode, seed=seed+1, device=device)
+        U_v  = get_block_rotation(hidden, block_size=8, mode=rot_mode, seed=seed+2, device=device)
+        U_gu = get_block_rotation(inter,  block_size=8, mode=rot_mode, seed=seed+3, device=device)
+        U_d  = get_block_rotation(hidden, block_size=8, mode=rot_mode, seed=seed+4, device=device)
+        print(f"  [block_u] U_8(8,8) × {hidden//8} blocks")
+    else:
+        U_qk = get_rotation(hidden, mode=rot_mode, seed=seed+1, device=device)  # R3
+        U_v  = get_rotation(hidden, mode=rot_mode, seed=seed+2, device=device)  # R2
+        U_gu = get_rotation(inter,  mode=rot_mode, seed=seed+3, device=device)  # R4
+        U_d  = get_rotation(hidden, mode=rot_mode, seed=seed+4, device=device)  # R5
 
     print(f"  V({hidden},{hidden})  U_qk({hidden},{hidden})  U_v({hidden},{hidden})")
     print(f"  U_gu({inter},{inter})  U_d({hidden},{hidden})")
@@ -241,7 +250,7 @@ def run_llama_rot_v2(
     model_name="meta-llama/Llama-2-7b-hf", bits=4, dataset="wikitext2",
     nsamples=128, seqlen=2048, seed=0, blocksize=128, percdamp=0.01,
     groupsize=-1, sym=False, actorder=False, rot_mode="hadamard",
-    dev="cuda:0", eval_before=True, use_u=True, v1_mode=False, use_e8=False, uwvt_mode=False,
+    dev="cuda:0", eval_before=True, use_u=True, v1_mode=False, use_e8=False, uwvt_mode=False, block_u=False,
     export=False,
 ):
     print(f"Loading model: {model_name}")
@@ -262,7 +271,7 @@ def run_llama_rot_v2(
         model, trainloader, dev,
         bits=bits, blocksize=blocksize, percdamp=percdamp,
         groupsize=groupsize, sym=sym, actorder=actorder,
-        rot_mode=rot_mode, seed=seed, use_u=use_u, v1_mode=v1_mode, use_e8=use_e8, uwvt_mode=uwvt_mode,
+        rot_mode=rot_mode, seed=seed, use_u=use_u, v1_mode=v1_mode, use_e8=use_e8, uwvt_mode=uwvt_mode, block_u=block_u,
         export=export,
     )
     print(f"\n[RotatedGPTQ v2] Total time: {time.time()-t0:.1f}s")
