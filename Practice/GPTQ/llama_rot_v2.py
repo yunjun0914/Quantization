@@ -365,33 +365,30 @@ def run_llama_rot_v2(
                 save_path = "e8p_2bit.pt"
                 print(f"[Real Quant] 모델 저장 중... {save_path}")
                 torch.save({
-                    'model_state': {
-                        name: param.cpu()
-                        for name, param in model_real.named_parameters()
-                    },
                     'quantized_layers': {
                         k: {
-                            'idx':   v['idx'],
+                            'idx':   v['idx'].to(torch.int16),  # int32 → int16 (2bpw)
                             'scale': v['scale'],
                         } for k, v in quantized_layers.items()
                     },
-                    'rotations': {
-                        k: (U.cpu() if U is not None else None,
-                            Vr.cpu() if Vr is not None else None)
-                        for k, (U, Vr) in rotations.items()
+                    'config': {
+                        'model_name': model_name,
+                        'seed':       seed,
+                        'rot_mode':   rot_mode,
+                        'bits':       bits,
+                        'ppl':        ppl_real,
+                        'bpw':        2.0,
                     },
-                    'V': V.cpu(),
-                    'U_gu': U_gu.cpu(),
-                    'ppl': ppl_real,
-                    'bits': 2,
-                    'bpw': 2.0,
+                    # rotations은 저장 안 함 → inference 시 seed로 재생성
                 }, save_path)
                 save_size = sum(
-                    v['idx'].numel() * v['idx'].element_size()
+                    v['idx'].numel() * 2  # int16 = 2bytes
                     for v in quantized_layers.values()
                 ) / 1e9
+                total_weights = sum(v['idx'].numel() * 8 for v in quantized_layers.values())
+                bpw = save_size * 8e9 / total_weights
                 print(f"[Real Quant] 저장 완료: {save_path}")
-                print(f"[Real Quant] idx 크기: {save_size:.2f}GB (2bpw)")
+                print(f"[Real Quant] idx (int16): {save_size:.2f}GB = {bpw:.2f}bpw")
 
             del model_real
             torch.cuda.empty_cache()
