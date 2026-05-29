@@ -35,7 +35,6 @@ def parse_args():
     p.add_argument("--no_u",      action="store_true", help="ablation: U rotation 제거")
     p.add_argument("--v1_mode",    action="store_true", help="ablation: V1 방식 (U^T 복원 없음, 회전 오차 포함)")
     p.add_argument("--uwvt",        action="store_true", help="ablation: UWV^T 공간에서 직접 오차 전파")
-    p.add_argument("--block_u",     action="store_true", help="E8P block-aligned 8×8 rotation (I⊗U_8)")
     p.add_argument("--e8",         action="store_true", help="E8 lattice quantization (8D cross-row)")
     p.add_argument("--dev",       type=str,   default="cuda:0")
     p.add_argument("--compare",   action="store_true", help="기존 GPTQ와 PPL 비교")
@@ -73,7 +72,6 @@ if __name__ == "__main__":
             use_u       = not args.no_u,
             v1_mode     = args.v1_mode,
             uwvt_mode   = args.uwvt,
-            block_u     = args.block_u,
             use_e8      = args.e8,
             export      = args.export,
         )
@@ -98,11 +96,17 @@ if __name__ == "__main__":
             )
 
         print("\n" + "=" * 60)
-        print(f"  FP16 baseline              : {out_rot['ppl_fp16']:.2f}")
-        print(f"  {args.bits}bit RotatedGPTQ v2       : {out_rot['ppl_quant']:.2f}")
+        print(f"  Calibration                : {args.dataset}")
+        print(f"  FP16        WikiText2      : {out_rot['ppl_fp16_wiki']:.2f}")
+        print(f"  FP16        C4             : {out_rot['ppl_fp16_c4']:.2f}")
+        if not args.export:
+            print(f"  {args.bits}bit RotGPTQ   WikiText2  : {out_rot['ppl_quant_wiki']:.2f}")
+            print(f"  {args.bits}bit RotGPTQ   C4         : {out_rot['ppl_quant_c4']:.2f}")
+        if out_rot['ppl_real'] is not None:
+            print(f"  Real Quant  WikiText2     : {out_rot['ppl_real']:.2f}")
         if args.compare:
             print(f"  {args.bits}bit GPTQ (baseline)    : {out_base['ppl_quant']:.2f}")
-            print(f"  차이 (rot - base)          : {out_rot['ppl_quant'] - out_base['ppl_quant']:+.2f}")
+            print(f"  차이 (rot - base)          : {out_rot['ppl_quant_wiki'] - out_base['ppl_quant']:+.2f}")
         print("=" * 60)
 
     else:
@@ -123,7 +127,6 @@ if __name__ == "__main__":
             use_u       = not args.no_u,
             v1_mode     = args.v1_mode,
             uwvt_mode   = args.uwvt,
-            block_u     = args.block_u,
             use_e8      = args.e8,
             export      = args.export,
         )

@@ -67,18 +67,7 @@ def llama_rot_sequential_v2(
     U_v  = get_rotation(hidden, mode=rot_mode, seed=seed+2, device=device)  # R2
     U_gu = get_rotation(inter,  mode=rot_mode, seed=seed+3, device=device)  # R4
     U_d  = get_rotation(hidden, mode=rot_mode, seed=seed+4, device=device)  # R5
-    if block_u:
-        # u @ U: full U로 outlier 분산 + block U_8로 8D Gaussianize
-        # uUWV^T - Q(uUWV^T) 꼴
-        u_qk = get_block_rotation(hidden, block_size=8, mode=rot_mode, seed=seed+5, device=device)
-        u_v  = get_block_rotation(hidden, block_size=8, mode=rot_mode, seed=seed+6, device=device)
-        u_gu = get_block_rotation(inter,  block_size=8, mode=rot_mode, seed=seed+7, device=device)
-        u_d  = get_block_rotation(hidden, block_size=8, mode=rot_mode, seed=seed+8, device=device)
-        U_qk = u_qk @ U_qk   # (I⊗U_8) @ U_had
-        U_v  = u_v  @ U_v
-        U_gu = u_gu @ U_gu
-        U_d  = u_d  @ U_d
-        print(f"  [block_u] u=(I⊗U_8) @ U_had")
+
 
     print(f"  V({hidden},{hidden})  U_qk({hidden},{hidden})  U_v({hidden},{hidden})")
     print(f"  U_gu({inter},{inter})  U_d({hidden},{hidden})")
@@ -250,7 +239,7 @@ def eval_ppl(model, testenc, dev, seqlen=2048):
 
 
 def run_llama_rot_v2(
-    model_name="meta-llama/Llama-2-7b-hf", bits=4, dataset="wikitext2",
+    model_name="meta-llama/Llama-2-7b-hf", bits=4, dataset="c4",
     nsamples=128, seqlen=2048, seed=0, blocksize=128, percdamp=0.01,
     groupsize=-1, sym=False, actorder=False, rot_mode="hadamard",
     dev="cuda:0", eval_before=True, use_u=True, v1_mode=False, use_e8=False, uwvt_mode=False, block_u=False,
@@ -260,13 +249,17 @@ def run_llama_rot_v2(
     model = LlamaForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16)
 
     trainloader, _ = get_loaders(dataset, nsamples=nsamples, seed=seed, seqlen=seqlen, model=model_name)
-    _, testenc     = get_loaders("wikitext2", nsamples=nsamples, seed=seed, seqlen=seqlen, model=model_name)
+    # GPTQ 논문 방식: wikitext2 + c4 둘 다 평가
+    _, testenc_wiki = get_loaders("wikitext2", nsamples=nsamples, seed=seed, seqlen=seqlen, model=model_name)
+    _, testenc_c4   = get_loaders("c4",        nsamples=nsamples, seed=seed, seqlen=seqlen, model=model_name)
 
-    ppl_fp16 = None
+    ppl_fp16_wiki = None
+    ppl_fp16_c4   = None
     if eval_before:
         model = model.to(dev)
-        ppl_fp16 = eval_ppl(model, testenc, dev, seqlen)
-        print(f"\n[FP16 baseline] PPL = {ppl_fp16:.2f}")
+        ppl_fp16_wiki = eval_ppl(model, testenc_wiki, dev, seqlen)
+        ppl_fp16_c4   = eval_ppl(model, testenc_c4,   dev, seqlen)
+        print(f"\n[FP16 baseline] WikiText2={ppl_fp16_wiki:.2f}  C4={ppl_fp16_c4:.2f}")
         model = model.cpu()
 
     t0      = time.time()
@@ -274,7 +267,7 @@ def run_llama_rot_v2(
         model, trainloader, dev,
         bits=bits, blocksize=blocksize, percdamp=percdamp,
         groupsize=groupsize, sym=sym, actorder=actorder,
-        rot_mode=rot_mode, seed=seed, use_u=use_u, v1_mode=v1_mode, use_e8=use_e8, uwvt_mode=uwvt_mode, block_u=block_u,
+        rot_mode=rot_mode, seed=seed, use_u=use_u, v1_mode=v1_mode, use_e8=use_e8, uwvt_mode=uwvt_mode,
         export=export,
     )
     print(f"\n[RotatedGPTQ v2] Total time: {time.time()-t0:.1f}s")
@@ -301,10 +294,12 @@ def run_llama_rot_v2(
 
     model   = model.to(dev)
     if not export:
-        ppl_q = eval_ppl(model, testenc, dev, seqlen)
-        print(f"[{bits}bit RotatedGPTQ v2] PPL = {ppl_q:.2f}")
+        ppl_q_wiki = eval_ppl(model, testenc_wiki, dev, seqlen)
+        ppl_q_c4   = eval_ppl(model, testenc_c4,   dev, seqlen)
+        ppl_q = ppl_q_wiki
+        print(f"[{bits}bit RotatedGPTQ v2] WikiText2={ppl_q_wiki:.2f}  C4={ppl_q_c4:.2f}")
     else:
-        ppl_q = None
+        ppl_q = ppl_q_wiki = ppl_q_c4 = None
         print(f"[Export mode] fake quant PPL 생략")
 
     for h in r4_hooks:
@@ -356,8 +351,10 @@ def run_llama_rot_v2(
                         linears["mlp.down_proj"].register_forward_pre_hook(
                             make_r4_hook(U_gu_cpu))
                     )
-            ppl_real = eval_ppl(model_real, testenc, dev, seqlen)
-            print(f"[Real Quant E8P] PPL = {ppl_real:.2f}")
+            ppl_real_wiki = eval_ppl(model_real, testenc_wiki, dev, seqlen)
+            ppl_real_c4   = eval_ppl(model_real, testenc_c4,   dev, seqlen)
+            ppl_real = ppl_real_wiki
+            print(f"[Real Quant E8P] WikiText2={ppl_real_wiki:.2f}  C4={ppl_real_c4:.2f}")
             for h in r4_hooks_real: h.remove()
 
             # 모델 저장
@@ -393,4 +390,11 @@ def run_llama_rot_v2(
             del model_real
             torch.cuda.empty_cache()
 
-    return {"ppl_fp16": ppl_fp16, "ppl_quant": ppl_q, "ppl_real": ppl_real, "results": results}
+    return {
+        "ppl_fp16_wiki":  ppl_fp16_wiki,
+        "ppl_fp16_c4":    ppl_fp16_c4,
+        "ppl_quant_wiki": ppl_q_wiki if not export else None,
+        "ppl_quant_c4":   ppl_q_c4  if not export else None,
+        "ppl_real":       ppl_real,
+        "results":        results,
+    }
