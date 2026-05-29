@@ -142,16 +142,21 @@ def build_e8p_model(model, quantized_layers, V, rotations=None):
     print(f"  [Real Quant] idx (int16): {idx_bytes/1e9:.2f}GB = {idx_bytes*8/sum(m.idx.numel()*8 for m in model.modules() if isinstance(m, E8PLinear)):.2f}bpw")
 
     # U, V unique tensor들을 GPU로 올리기
-    # 같은 id의 tensor는 한 번만 이동 (메모리 중복 없음)
+    # CPU tensor id 기준으로 중복 제거 → 같은 tensor 공유
     dev = next(model.parameters()).device
-    moved = set()
+    moved = {}  # cpu_id -> gpu_tensor
     for m in model.modules():
         if isinstance(m, E8PLinear):
-            if m.U is not None and id(m.U) not in moved:
-                m.U = m.U.to(dev)
-                moved.add(id(m.U))
-            if m.V is not None and id(m.V) not in moved:
-                m.V = m.V.to(dev)
-                moved.add(id(m.V))
+            if m.U is not None:
+                cpu_id = id(m.U)
+                if cpu_id not in moved:
+                    moved[cpu_id] = m.U.to(dev)
+                m.U = moved[cpu_id]   # 같은 GPU tensor 공유
+            if m.V is not None:
+                cpu_id = id(m.V)
+                if cpu_id not in moved:
+                    moved[cpu_id] = m.V.to(dev)
+                m.V = moved[cpu_id]   # 같은 GPU tensor 공유
+    print(f"  U/V unique tensors on GPU: {len(moved)}개")
 
     return model, hooks
