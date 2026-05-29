@@ -359,6 +359,40 @@ def run_llama_rot_v2(
             ppl_real = eval_ppl(model_real, testenc, dev, seqlen)
             print(f"[Real Quant E8P] PPL = {ppl_real:.2f}")
             for h in r4_hooks_real: h.remove()
+
+            # 모델 저장
+            if export:
+                save_path = "e8p_2bit.pt"
+                print(f"[Real Quant] 모델 저장 중... {save_path}")
+                torch.save({
+                    'model_state': {
+                        name: param.cpu()
+                        for name, param in model_real.named_parameters()
+                    },
+                    'quantized_layers': {
+                        k: {
+                            'idx':   v['idx'],
+                            'scale': v['scale'],
+                        } for k, v in quantized_layers.items()
+                    },
+                    'rotations': {
+                        k: (U.cpu() if U is not None else None,
+                            Vr.cpu() if Vr is not None else None)
+                        for k, (U, Vr) in rotations.items()
+                    },
+                    'V': V.cpu(),
+                    'U_gu': U_gu.cpu(),
+                    'ppl': ppl_real,
+                    'bits': 2,
+                    'bpw': 2.0,
+                }, save_path)
+                save_size = sum(
+                    v['idx'].numel() * v['idx'].element_size()
+                    for v in quantized_layers.values()
+                ) / 1e9
+                print(f"[Real Quant] 저장 완료: {save_path}")
+                print(f"[Real Quant] idx 크기: {save_size:.2f}GB (2bpw)")
+
             del model_real
             torch.cuda.empty_cache()
 
