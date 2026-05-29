@@ -36,8 +36,15 @@ class E8PLinear(nn.Module):
         self.register_buffer('scale', scale.cpu())
         self.d_row = d_row
         self.d_col = d_col
-        self.U     = U   # globally shared tensor 참조
-        self.V     = V   # globally shared tensor 참조
+        # register_buffer로 등록 → model.to(device) 시 자동 GPU 이동
+        if U is not None:
+            self.register_buffer('U', U.cpu())
+        else:
+            self.U = None
+        if V is not None:
+            self.register_buffer('V', V.cpu())
+        else:
+            self.V = None
 
         if bias is not None:
             self.register_buffer('bias', bias.cpu())
@@ -60,13 +67,13 @@ class E8PLinear(nn.Module):
         q  = q * self.scale
         q  = q.permute(0, 2, 1).reshape(self.d_row, self.d_col)  # UWV^T 공간
 
-        # U^T 적용 → WV^T 공간 (fake quant의 U^T @ Q_rot)
+        # U^T 적용 → WV^T 공간
         if self.U is not None:
-            q = self.U.to(q.device).t().float() @ q.float()
+            q = self.U.t().float() @ q.float()
 
-        # V 적용 → W 공간 (fake quant의 Q @ V)
+        # V 적용 → W 공간
         if self.V is not None:
-            q = q.float() @ self.V.to(q.device).float()
+            q = q.float() @ self.V.float()
 
         return q
 
