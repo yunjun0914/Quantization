@@ -311,16 +311,10 @@ def run_llama_rot_v2(
         print("\n[Real Quant] E8P index 기반 PPL 측정 중...")
         from llama_e8p_inference import E8PLinear, build_e8p_model
 
-        # 기존 fake quant 모델 먼저 삭제 (메모리 확보)
-        model = model.cpu()
-        del model
-        torch.cuda.empty_cache()
-
-        # quantized_layers 추출 후 results 해제 (메모리 절약)
+        # quantized_layers 추출
         quantized_layers = {}
         for layer_name, res in results.items():
             if 'e8p_idx' in res:
-                # layer_name: 'layer0.self_attn.q_proj' → sub_name: 'self_attn.q_proj'
                 sub_name = '.'.join(layer_name.split('.')[1:])
                 Ur, Vr = rotations.get(sub_name, (None, None))
                 quantized_layers[layer_name] = {
@@ -332,7 +326,9 @@ def run_llama_rot_v2(
         del results
         import gc; gc.collect()
 
-        model_real = LlamaForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16)
+        # fake quant 모델을 그대로 E8PLinear로 교체 (새로 로드 안 함)
+        model = model.cpu()
+        model_real = model
         if quantized_layers:
             # rotations: layer별 U 정보 전달
             model_real, r4_hooks_real = build_e8p_model(
