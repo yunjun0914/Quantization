@@ -78,10 +78,13 @@ def llama_rot_sequential_v2(
         "self_attn.k_proj": (U_qk if use_u else None, V),
         "self_attn.v_proj": (U_v  if use_u else None, V),
         "self_attn.o_proj": (U_qk if use_u else None, V),
-        "mlp.gate_proj":    (U_gu if use_u else None, V),   # E8P: U_gu 시도
+        "mlp.gate_proj":    (U_gu if use_u else None, V),
         "mlp.up_proj":      (U_gu if use_u else None, V),
         "mlp.down_proj":    (U_d  if use_u else None, U_gu),
     }
+    # CPU 복사본 (export/inference용, GPU 메모리 분리)
+    def _cpu(t): return t.cpu() if t is not None else None
+    rotations_cpu = {k: (_cpu(u), _cpu(v)) for k, (u, v) in rotations.items()}
 
     # ── 입력 캡처 ─────────────────────────────────────────────────────────
     nsamples = len(dataloader)
@@ -173,11 +176,11 @@ def llama_rot_sequential_v2(
             results[f"layer{layer_idx}.{name}"] = res_entry
             print(f"loss={loss.mean().item():.6f}")
             handler.free()
+        handlers.clear()  # handler GPU tensor 해제
 
         # ── Step 4: V 흡수 (Q @ V) ───────────────────────────────────────
         # down_proj: R4(U_gu)는 online → Q만 저장 (@ U_gu 안 함)
         # Q @ V: weight 복원 (next layer input 계산을 위해 항상 필요)
-        # export 모드에서도 forward pass에 사용 후 GPU에만 유지 (CPU 저장 안 함)
         for name, lin in linears.items():
                 if name not in Q_dict: continue
                 _, Vr = rotations[name]
@@ -185,6 +188,8 @@ def llama_rot_sequential_v2(
                     lin.weight.data = Q_dict[name]
                 else:
                     lin.weight.data = (Q_dict[name].float() @ Vr.float()).to(dtype)
+        # Q_dict 즉시 해제 (idx로 저장 완료, 더 이상 불필요)
+        Q_dict.clear()
 
         # Step 5 불필요: inner loop q = U^T @ Q(U @ WV^T) 이미 복원
         # Step 4: Q @ V = U^T @ Q(U @ WV^T) @ V → inference x만 넣으면 ≈ Wx
@@ -216,12 +221,17 @@ def llama_rot_sequential_v2(
 
         if "mlp.down_proj" in linears:
             r4_hook.remove()
+            del U_gu_dev  # GPU tensor 해제
 
         layer = layer.cpu(); torch.cuda.empty_cache()
         print(f"  ↳ done in {time.time()-t0:.1f}s")
 
     model.config.use_cache = use_cache
-    return results, U_gu, V, rotations
+    del inps
+    import gc; gc.collect()
+    torch.cuda.empty_cache()
+
+    return results, U_gu, V, rotations, rotations_cpu
 
 
 @torch.no_grad()
@@ -263,7 +273,7 @@ def run_llama_rot_v2(
         model = model.cpu()
 
     t0      = time.time()
-    results, U_gu, V, rotations = llama_rot_sequential_v2(
+    results, U_gu, V, rotations, rotations_cpu = llama_rot_sequential_v2(
         model, trainloader, dev,
         bits=bits, blocksize=blocksize, percdamp=percdamp,
         groupsize=groupsize, sym=sym, actorder=actorder,
@@ -316,7 +326,7 @@ def run_llama_rot_v2(
         for layer_name, res in results.items():
             if 'e8p_idx' in res:
                 sub_name = '.'.join(layer_name.split('.')[1:])
-                Ur, Vr = rotations.get(sub_name, (None, None))
+                Ur, Vr = rotations_cpu.get(sub_name, (None, None))
                 quantized_layers[layer_name] = {
                     'idx':   res['e8p_idx'],
                     'scale': res['e8p_scale'],
@@ -331,8 +341,9 @@ def run_llama_rot_v2(
         model_real = model
         if quantized_layers:
             # rotations: layer별 U 정보 전달
+            V_cpu = rotations_cpu['self_attn.q_proj'][1]  # globally shared V cpu
             model_real, r4_hooks_real = build_e8p_model(
-                model_real, quantized_layers, V, rotations=rotations
+                model_real, quantized_layers, V_cpu, rotations=rotations_cpu
             )
             model_real = model_real.to(dev)
             # R4 hook: down_proj input에 U_gu 적용 (fake quant와 동일)
