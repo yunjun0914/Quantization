@@ -91,11 +91,12 @@ def get_c4(
         start = random.randint(0, tokens.input_ids.shape[1] - seqlen - 1)
         trainloader.append(tokens.input_ids[:, start : start + seqlen])
 
-    # validation: 256개 샘플 이어 붙여 PPL 측정
-    valenc_list = []
-    for i in range(256):
-        valenc_list.append(tokenizer(valdata[i]["text"], return_tensors="pt").input_ids)
-    valenc = torch.cat(valenc_list, dim=1)
+    # validation: GPTQ 논문 방식
+    # 문서를 이어붙여 연속 텍스트로 만든 후 stride PPL 측정
+    valenc = tokenizer(
+        " ".join(valdata[i]["text"] for i in range(1100)),
+        return_tensors="pt"
+    )
 
     return trainloader, valenc
 
