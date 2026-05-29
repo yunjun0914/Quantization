@@ -365,13 +365,9 @@ def run_llama_rot_v2(
                 save_path = "e8p_2bit.pt"
                 print(f"[Real Quant] 모델 저장 중... {save_path}")
                 torch.save({
-                    'model_state': {
-                        name: param.cpu()
-                        for name, param in model_real.named_parameters()
-                    },
                     'quantized_layers': {
                         k: {
-                            'idx':   v['idx'],
+                            'idx':   v['idx'].to(torch.int16),  # int32 → int16 (2bpw)
                             'scale': v['scale'],
                         } for k, v in quantized_layers.items()
                     },
