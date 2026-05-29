@@ -168,7 +168,7 @@ def llama_rot_sequential_v2(
             }
             # export 모드: E8P index만 저장 (U, V는 rotations에서 직접 전달)
             if export and use_e8 and hasattr(handler, 'e8p_idx'):
-                res_entry['e8p_idx']   = handler.e8p_idx.cpu()
+                res_entry['e8p_idx']   = handler.e8p_idx.cpu().to(torch.int16)
                 res_entry['e8p_scale'] = handler.e8p_scale.cpu()
             results[f"layer{layer_idx}.{name}"] = res_entry
             print(f"loss={loss.mean().item():.6f}")
@@ -316,7 +316,7 @@ def run_llama_rot_v2(
         del model
         torch.cuda.empty_cache()
 
-        model_real = LlamaForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16)
+        # quantized_layers 추출 후 results 해제 (메모리 절약)
         quantized_layers = {}
         for layer_name, res in results.items():
             if 'e8p_idx' in res:
@@ -326,9 +326,13 @@ def run_llama_rot_v2(
                 quantized_layers[layer_name] = {
                     'idx':   res['e8p_idx'],
                     'scale': res['e8p_scale'],
-                    'U':     Ur,   # globally shared 참조 (메모리 중복 없음)
+                    'U':     Ur,
                     'V':     Vr,
                 }
+        del results
+        import gc; gc.collect()
+
+        model_real = LlamaForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16)
         if quantized_layers:
             # rotations: layer별 U 정보 전달
             model_real, r4_hooks_real = build_e8p_model(
@@ -354,6 +358,7 @@ def run_llama_rot_v2(
             ppl_real_wiki = eval_ppl(model_real, testenc_wiki, dev, seqlen)
             ppl_real_c4   = eval_ppl(model_real, testenc_c4,   dev, seqlen)
             ppl_real = ppl_real_wiki
+            ppl_real_c4_val = ppl_real_c4
             print(f"[Real Quant E8P] WikiText2={ppl_real_wiki:.2f}  C4={ppl_real_c4:.2f}")
             for h in r4_hooks_real: h.remove()
 
@@ -395,6 +400,7 @@ def run_llama_rot_v2(
         "ppl_fp16_c4":    ppl_fp16_c4,
         "ppl_quant_wiki": ppl_q_wiki if not export else None,
         "ppl_quant_c4":   ppl_q_c4  if not export else None,
-        "ppl_real":       ppl_real,
+        "ppl_real_wiki":  ppl_real if export else None,
+        "ppl_real_c4":    ppl_real_c4_val if export else None,
         "results":        results,
     }
