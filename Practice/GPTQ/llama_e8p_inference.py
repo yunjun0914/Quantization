@@ -36,15 +36,10 @@ class E8PLinear(nn.Module):
         self.register_buffer('scale', scale.cpu())
         self.d_row = d_row
         self.d_col = d_col
-        # register_buffer로 등록 → model.to(device) 시 자동 GPU 이동
-        if U is not None:
-            self.register_buffer('U', U.cpu())
-        else:
-            self.U = None
-        if V is not None:
-            self.register_buffer('V', V.cpu())
-        else:
-            self.V = None
+        # globally shared 참조 (register_buffer 안 함 → 복사본 생성 방지)
+        # build_e8p_model에서 .to(device) 후 참조 전달
+        self.U = U
+        self.V = V
 
         if bias is not None:
             self.register_buffer('bias', bias.cpu())
@@ -69,11 +64,13 @@ class E8PLinear(nn.Module):
 
         # U^T 적용 → WV^T 공간
         if self.U is not None:
-            q = self.U.t().float() @ q.float()
+            U = self.U if self.U.device == q.device else self.U.to(q.device)
+            q = U.t().float() @ q.float()
 
         # V 적용 → W 공간
         if self.V is not None:
-            q = q.float() @ self.V.float()
+            V = self.V if self.V.device == q.device else self.V.to(q.device)
+            q = q.float() @ V.float()
 
         return q
 
@@ -143,5 +140,18 @@ def build_e8p_model(model, quantized_layers, V, rotations=None):
         for m in model.modules() if isinstance(m, E8PLinear)
     )
     print(f"  [Real Quant] idx (int16): {idx_bytes/1e9:.2f}GB = {idx_bytes*8/sum(m.idx.numel()*8 for m in model.modules() if isinstance(m, E8PLinear)):.2f}bpw")
+
+    # U, V unique tensor들을 GPU로 올리기
+    # 같은 id의 tensor는 한 번만 이동 (메모리 중복 없음)
+    dev = next(model.parameters()).device
+    moved = set()
+    for m in model.modules():
+        if isinstance(m, E8PLinear):
+            if m.U is not None and id(m.U) not in moved:
+                m.U = m.U.to(dev)
+                moved.add(id(m.U))
+            if m.V is not None and id(m.V) not in moved:
+                m.V = m.V.to(dev)
+                moved.add(id(m.V))
 
     return model, hooks
