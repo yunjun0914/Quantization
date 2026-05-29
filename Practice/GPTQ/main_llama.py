@@ -20,7 +20,7 @@ from llama import run_llama
 def parse_args():
     p = argparse.ArgumentParser(description="LLaMA Rotated GPTQ  |  김윤준")
     p.add_argument("--model",     type=str,   default="meta-llama/Llama-2-7b-hf")
-    p.add_argument("--dataset",   type=str,   default="wikitext2", choices=["wikitext2","c4"])
+    p.add_argument("--dataset",   type=str,   default="c4", choices=["wikitext2","c4"])
     p.add_argument("--nsamples",  type=int,   default=128)
     p.add_argument("--seqlen",    type=int,   default=2048)
     p.add_argument("--seed",      type=int,   default=0)
