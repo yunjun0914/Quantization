@@ -119,17 +119,26 @@ class RotatedGPTQ:
         use_e8vq = self.use_e8    and (bits == 2) and (self.d_row % 8 == 0)
 
         # ── Z-aware W initialization ─────────────────────────────────────
-        # Z = W_rot @ VX → E8P(Z) → W = Z_q @ VX^T @ H̃^{-1}
-        # Hinv 재활용: H^{-1} = Hinv^T @ Hinv
+        # Z' = W_rot @ VX @ R^T = UWXR^T  (R: n×n random Hadamard)
+        # incoherence: X 오른쪽에 R → Gaussian-like 분포 for E8P
+        # R 상쇄: ||c - UWXR^T||² → UWXX^TW^TU^T (R independent)
+        # 복원: W_rot = Z'_q @ R @ VX^+
         scale_e8_layer = None
         if use_e8vq and VX is not None:
             W_rot_za = W if (uwvt_mode and self.U is not None) else self._apply_U(W)
-            Z_za     = W_rot_za @ VX                          # (d_row, n)
+            n_vx     = VX.shape[1]
+
+            # R: (n, n) random Hadamard for incoherence
+            from rotation import get_rotation
+            R = get_rotation(n_vx, mode='hadamard', seed=42, device=VX.device)
+
+            # Z' = W_rot @ VX @ R^T = UWXR^T
+            VXRt  = VX @ R.T                              # (d_col, n)
+            Z_za  = W_rot_za @ VXRt                       # (d_row, n)
             scale_za = (Z_za.square().mean().sqrt() / 0.9).clamp(min=1e-8)
             scale_e8_layer = scale_za
 
-            # vectorized E8P on Z
-            n_vx     = VX.shape[1]
+            # vectorized E8P on Z'
             Z_blocks = Z_za.reshape(self.d_row // 8, 8, n_vx)
             scale_g  = scale_za.reshape(-1, 1, 1)
             Z_norm   = Z_blocks / scale_g
@@ -143,13 +152,24 @@ class RotatedGPTQ:
                               .reshape(self.d_row, n_vx) * scale_za)
             del Z_za, Z_blocks, Z_norm, Z_flat, q_flat
 
-            # W 복원: H^{-1} = Hinv^T @ Hinv
-            H_inv = Hinv.T @ Hinv
-            W     = Z_q @ VX.T @ H_inv / n_vx
-            del Z_q, H_inv
+            # 복원: W_rot = Z'_q @ R @ VX^T @ H̃^{-1}
+            # VXRt @ VXRt^T = VX @ VX^T (R 상쇄)
+            # → G^{-1} = H̃^{-1} = Hinv^T @ Hinv
+            H_inv = Hinv.T @ Hinv                          # (d_col, d_col)
+            W     = Z_q @ VXRt.T @ H_inv                  # (d_row, d_col)
+            del Z_q, H_inv, VXRt, R
+
+            # scale 재계산: 복원된 W 기준
+            scale_e8_layer = (W.square().mean().sqrt() / 0.9).clamp(min=1e-8)
+
+            # NaN/Inf 방지
+            if not torch.isfinite(W).all():
+                W = self.layer.weight.data.clone().float()
+                if uwvt_mode and self.U is not None:
+                    W = self._apply_U(W)
+                scale_e8_layer = None
 
         if use_e8vq and scale_e8_layer is None:
-            # VX 없을 때 fallback: W_rot RMS
             W_rot_all = W if (uwvt_mode and self.U is not None) else self._apply_U(W)
             scale_e8_layer = (W_rot_all.square().mean().sqrt() / 0.9).clamp(min=1e-8)
 
