@@ -133,21 +133,24 @@ class RotatedGPTQ:
         Losses = torch.zeros_like(W)
 
         # ── Algorithm 1 ──────────────────────────────────────────────────
-        for i1 in range(0, self.d_col, blocksize):
-            i2    = min(i1 + blocksize, self.d_col)
+        # E8 block-GPTQ: E8P의 8D row 구조에 맞춰 8개 column씩 block 처리
+        # scalar: err (d_row,) × Hinv[j, j+:] → outer product
+        # block:  E_G (d_row, 8) @ Hinv_GG^{-1} @ Hinv_GR → block propagation
+        e8_block = 8 if use_e8vq else blocksize  # E8P일 때만 block=8 적용
+
+        for i1 in range(0, self.d_col, e8_block if use_e8vq else blocksize):
+            i2    = min(i1 + (e8_block if use_e8vq else blocksize), self.d_col)
             count = i2 - i1
 
-            W1    = W[:, i1:i2].clone()    # W 공간
+            W1    = W[:, i1:i2].clone()
             Q1    = torch.zeros_like(W1)
             Err1  = torch.zeros_like(W1)
             Loss1 = torch.zeros_like(W1)
-            Hinv1 = Hinv[i1:i2, i1:i2]
-
-
+            Hinv1 = Hinv[i1:i2, i1:i2]  # (block, block)
 
             for j_loc in range(count):
                 j_global = i1 + j_loc
-                col      = W1[:, j_loc]    # W 공간 column (d_row,)
+                col      = W1[:, j_loc]
                 d        = Hinv1[j_loc, j_loc]
 
                 if groupsize > 0 and j_global % groupsize == 0:
@@ -166,22 +169,18 @@ class RotatedGPTQ:
                     scale = scale_all[:, 0:1]
                     zero  = zero_all[:, 0:1]
 
-                # ── 핵심: 양자화 시에만 U 회전 ──────────────────────────
-                # uwvt_mode: W가 이미 UWV^T → U 추가 적용 없음
                 if uwvt_mode and self.U is not None:
-                    col_rot = col.unsqueeze(1)              # (d_row, 1) UWV^T 그대로
+                    col_rot = col.unsqueeze(1)
                 else:
-                    col_rot = self._apply_U(col.unsqueeze(1))  # (d_row, 1)
+                    col_rot = self._apply_U(col.unsqueeze(1))
 
                 if use_e8vq:
-                    # per-layer scalar scale
                     scale_e8_col = scale_e8_layer.expand(self.d_row // 8, 1)
                     if getattr(self, 'export_mode', False):
                         q_rot, _idx = quantize_e8_indexed(col_rot, scale_e8_col.to(col_rot.dtype))
                         idx_col_list.append(_idx.cpu())
                     else:
-                        q_rot = quantize_e8(col_rot,
-                                            scale_e8_col.to(col_rot.dtype))
+                        q_rot = quantize_e8(col_rot, scale_e8_col.to(col_rot.dtype))
                 elif use_nf:
                     q_rot = quantize_nf(col_rot, scale, nf_grid)
                 else:
@@ -191,9 +190,8 @@ class RotatedGPTQ:
                 col_rot = col_rot.squeeze(1)
 
                 if uwvt_mode and self.U is not None:
-                    # UWV^T 공간에서 직접 오차 전파
                     q   = q_rot
-                    err = (col_rot - q_rot) / d        # UWV^T 공간 오차
+                    err = (col_rot - q_rot) / d
                 elif self.restore_u:
                     q   = self._apply_Ut(q_rot.unsqueeze(1)).squeeze(1)
                     err = (col - q) / d
@@ -202,18 +200,29 @@ class RotatedGPTQ:
                     err = (col - q) / d
 
                 Q1[:, j_loc]    = q
-
-                # 오차 전파
                 Loss1[:, j_loc] = err ** 2
-
-                # W 공간에서 전파, H̃^{-1} 그대로
-                # (U: d_row 방향, H̃^{-1}: d_col 방향 → 독립)
                 W1[:, j_loc:]  -= torch.ger(err, Hinv1[j_loc, j_loc:])
                 Err1[:, j_loc]  = err
 
             Q[:, i1:i2]      = Q1
             Losses[:, i1:i2] = Loss1 / 2
-            W[:, i2:]       -= Err1 @ Hinv[i1:i2, i2:]
+
+            if use_e8vq and count == e8_block and i2 < self.d_col:
+                # E8 block-GPTQ: block 단위 오차 전파
+                # E_G = Err1 (d_row, 8), Hinv1 = (8,8) upper triangular
+                # E_norm = E_G @ Hinv1^{-1}: solve upper triangular system
+                # W[:, i2:] -= E_norm @ Hinv[i1:i2, i2:]
+                Hinv_GR = Hinv[i1:i2, i2:]  # (8, remaining)
+                # Hinv1이 upper triangular: torch.triangular_solve 사용
+                E_norm = torch.linalg.solve_triangular(
+                    Hinv1,
+                    Err1.T,       # (8, d_row)
+                    upper=True
+                ).T               # (d_row, 8)
+                W[:, i2:] -= E_norm @ Hinv_GR
+            else:
+                # scalar GPTQ: 기존 방식
+                W[:, i2:] -= Err1 @ Hinv[i1:i2, i2:]
 
         if actorder:
             Q = Q[:, invperm]
