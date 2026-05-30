@@ -153,17 +153,20 @@ class RotatedGPTQ:
                               .reshape(self.d_row, n_vx) * scale_za)
             del Z_prime, Z_blocks, Z_norm, Z_flat, q_flat
 
-            # W_q_z 복원: Q(Z') @ VXRt^+
-            # VXRt^+ = VXRt^T @ (VXRt @ VXRt^T)^{-1}
-            # Hessian 불필요, pseudoinverse로 직접 복원
-            G      = VXRt @ VXRt.T                        # (d_col, d_col)
+            # W_q_z 복원: Z_q @ VXRt^+
+            # VXRt^+ = (VXRt^T @ VXRt)^{-1} @ VXRt^T  (n×n full rank)
+            G      = VXRt.T @ VXRt                        # (n, n) full rank
             damp_g = percdamp * G.diag().mean()
-            G_inv  = torch.linalg.inv(G + damp_g * torch.eye(self.d_col, device=G.device))
-            W_q_z  = Z_q @ VXRt.T @ G_inv                # (d_row, d_col)
+            G_inv  = torch.linalg.inv(G + damp_g * torch.eye(n_vx, device=G.device))
+            W_q_z  = Z_q @ G_inv @ VXRt.T                # (d_row, d_col)
             del Z_q, G, G_inv, VXRt, R
 
             # scale: W_rot 기준
             scale_e8_layer = (W_rot_za.square().mean().sqrt() / 0.9).clamp(min=1e-8)
+
+            # W를 W_q_z로 초기화 (GPTQ 시작점)
+            if torch.isfinite(W_q_z).all():
+                W = W_q_z
 
             # NaN/Inf 방지
             if not torch.isfinite(W_q_z).all():
@@ -247,7 +250,6 @@ class RotatedGPTQ:
                 if uwvt_mode and self.U is not None:
                     q   = q_rot
                     if use_e8vq and W_q_z is not None:
-                        # Z-aware error: UWV^T[:, j] - W_q_z[:, j]
                         err = (col_rot - W_q_z[:, j_global]) / d
                     else:
                         err = (col_rot - q_rot) / d
