@@ -35,6 +35,7 @@ class RotatedGPTQ:
         self.V = V.to(self.dev).float()
 
         self.H        = torch.zeros((self.d_col, self.d_col), device=self.dev)
+        self.VX       = None   # (d_col, n) - for Z-aware quantization
         self.nsamples = 0
 
     def add_batch(self, inp: torch.Tensor, out: torch.Tensor):
@@ -51,6 +52,11 @@ class RotatedGPTQ:
             inp = self.V.unsqueeze(1) * inp  # elementwise: 1D V
         n   = inp.shape[1]
         self.H = (self.nsamples * self.H + 2 * inp @ inp.t()) / (self.nsamples + n)
+        # VX 축적: Z = W_rot @ VX 계산용
+        if self.VX is None:
+            self.VX = inp.detach()
+        else:
+            self.VX = torch.cat([self.VX, inp.detach()], dim=1)
         self.nsamples += n
 
     def quantize(
@@ -75,6 +81,7 @@ class RotatedGPTQ:
         if uwvt_mode and self.U is not None:
             W = self._apply_U(W)   # UWV^T 공간
         H = self.H.float()                           # H̃ = VHV^T
+        VX = self.VX.float() if self.VX is not None else None  # (d_col, n)
 
         # ── dead weight ───────────────────────────────────────────────────
         dead = (torch.diag(H) == 0)
@@ -113,8 +120,36 @@ class RotatedGPTQ:
         if use_e8vq:
             # uwvt_mode: W가 이미 UWV^T → U 추가 불필요
             W_rot_all = W if (uwvt_mode and self.U is not None) else self._apply_U(W)
-            scale_e8_layer = (W_rot_all.square().mean().sqrt() / 0.9
-                              ).clamp(min=1e-8).to(W.device)
+
+            if VX is not None:
+                # Z-aware quantization:
+                # 1. Z = UWX (d_row, n)
+                # 2. scale = RMS(Z) / 0.9
+                # 3. Z_q = E8P(Z)
+                # 4. W_init = Z_q @ VX^T @ H̃^{-1}  → GPTQ 초기값
+                Z_all = W_rot_all @ VX                # (d_row, n)
+                scale_e8_layer = (Z_all.square().mean().sqrt() / 0.9
+                                  ).clamp(min=1e-8).to(W.device)
+                scale_e8_exp = scale_e8_layer.expand(self.d_row // 8, 1)
+
+                # Z 직접 양자화
+                Z_q = torch.zeros_like(Z_all)
+                for _i in range(VX.shape[1]):
+                    col_z = Z_all[:, _i:_i+1]
+                    Z_q[:, _i:_i+1] = quantize_e8(
+                        col_z, scale_e8_exp.to(col_z.dtype)
+                    )
+                del Z_all
+
+                # W 복원: Z_q @ VX^T @ H̃^{-1}
+                # H̃^{-1} = Hinv^T @ Hinv (Cholesky 후 계산) → 여기선 직접 inv
+                n_vx = VX.shape[1]
+                H_inv_local = torch.linalg.inv(H + 1e-8 * torch.eye(self.d_col, device=H.device))
+                W = Z_q @ VX.T @ H_inv_local / n_vx
+                del Z_q, H_inv_local
+            else:
+                scale_e8_layer = (W_rot_all.square().mean().sqrt() / 0.9
+                                  ).clamp(min=1e-8).to(W.device)
             idx_col_list = []
 
         if groupsize <= 0:
@@ -198,32 +233,14 @@ class RotatedGPTQ:
                 Q1[:, j_loc]    = q
                 Loss1[:, j_loc] = err ** 2
 
-                if use_e8vq:
-                    # E8P group sign-magnitude propagation (vectorized)
-                    # 부호 보존 + group magnitude 균등화
-                    # E8P가 8개 row jointly 양자화 → magnitude는 group 단위로
-                    err_r  = err.reshape(-1, 8)                          # (d_row//8, 8)
-                    mag    = err_r.abs().mean(dim=1, keepdim=True)        # (d_row//8, 1)
-                    sign   = err_r.sign()                                  # (d_row//8, 8)
-                    err_prop = (sign * mag).reshape(-1)                   # (d_row,)
-                    W1[:, j_loc:] -= torch.ger(err_prop, Hinv1[j_loc, j_loc:])
-                else:
-                    W1[:, j_loc:] -= torch.ger(err, Hinv1[j_loc, j_loc:])
+                W1[:, j_loc:] -= torch.ger(err, Hinv1[j_loc, j_loc:])
 
                 Err1[:, j_loc]  = err
 
             Q[:, i1:i2]      = Q1
             Losses[:, i1:i2] = Loss1 / 2
 
-            if use_e8vq:
-                # cross-block sign-magnitude propagation
-                Err1_r    = Err1.reshape(-1, 8, Err1.shape[1])           # (d_row//8, 8, count)
-                mag       = Err1_r.abs().mean(dim=1, keepdim=True)       # (d_row//8, 1, count)
-                sign      = Err1_r.sign()                                  # (d_row//8, 8, count)
-                Err1_prop = (sign * mag).reshape(self.d_row, -1)         # (d_row, count)
-                W[:, i2:] -= Err1_prop @ Hinv[i1:i2, i2:]
-            else:
-                W[:, i2:] -= Err1 @ Hinv[i1:i2, i2:]
+            W[:, i2:] -= Err1 @ Hinv[i1:i2, i2:]
 
         if actorder:
             Q = Q[:, invperm]
