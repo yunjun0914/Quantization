@@ -86,14 +86,8 @@ class RotatedGPTQ:
         diag_idx = torch.arange(self.d_col, device=self.dev)
         H[diag_idx, diag_idx] += damp_val
 
-        # row_dep: Cholesky 전에 H̃ 보관
-        # H_row_eff = W_rot @ H̃ @ W_rot^T (d_row × d_row)
-        # Cholesky 후에는 H가 수정되므로 미리 계산
-        if use_e8vq and getattr(self, 'row_dep', False):
-            W_rot_for_hrow = W if (uwvt_mode and self.U is not None) else self._apply_U(W)
-            H_row_eff = W_rot_for_hrow @ H @ W_rot_for_hrow.T  # (d_row, d_row)
-        else:
-            H_row_eff = None
+        # row_dep: H̃ 보관 (Cholesky 전, H가 수정되기 전에 저장)
+        H_for_rowdep = H.clone() if getattr(self, 'row_dep', False) else None
 
         L    = torch.linalg.cholesky(H)
         Hinv = torch.cholesky_inverse(L)
@@ -118,6 +112,14 @@ class RotatedGPTQ:
         use_nf   = nf_grid is not None
         use_e8vq = self.use_e8    and (bits == 2) and (self.d_row % 8 == 0)
 
+        # H_row_eff = W_rot @ H̃ @ W_rot^T (d_row × d_row)
+        # loss = ||(Ŵ-W) W_rot X||²_F = tr(E · H_row_eff · E^T)
+        if use_e8vq and getattr(self, 'row_dep', False) and H_for_rowdep is not None:
+            W_rot_for_hrow = W if (uwvt_mode and self.U is not None) else self._apply_U(W)
+            H_row_eff = W_rot_for_hrow @ H_for_rowdep @ W_rot_for_hrow.T  # (d_row, d_row)
+            del H_for_rowdep
+        else:
+            H_row_eff = None
 
         # E8P per-layer scalar scale (QuIP# 방식)
         if use_e8vq:
