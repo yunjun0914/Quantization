@@ -26,7 +26,6 @@ python -u main_llama.py \
     --v2 \
     --e8 \
     --uwvt \
-    --row_dep \
     --compare \
     --percdamp 0.01 \
     --dev cuda:0 
