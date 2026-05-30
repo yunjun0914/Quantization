@@ -199,9 +199,13 @@ class RotatedGPTQ:
                 Loss1[:, j_loc] = err ** 2
 
                 if use_e8vq:
-                    # E8P group-mean error propagation (vectorized)
-                    # err: (d_row,) → reshape (d_row//8, 8) → mean → expand
-                    err_prop = err.reshape(-1, 8).mean(dim=1, keepdim=True).expand(-1, 8).reshape(-1)
+                    # E8P group sign-magnitude propagation (vectorized)
+                    # 부호 보존 + group magnitude 균등화
+                    # E8P가 8개 row jointly 양자화 → magnitude는 group 단위로
+                    err_r  = err.reshape(-1, 8)                          # (d_row//8, 8)
+                    mag    = err_r.abs().mean(dim=1, keepdim=True)        # (d_row//8, 1)
+                    sign   = err_r.sign()                                  # (d_row//8, 8)
+                    err_prop = (sign * mag).reshape(-1)                   # (d_row,)
                     W1[:, j_loc:] -= torch.ger(err_prop, Hinv1[j_loc, j_loc:])
                 else:
                     W1[:, j_loc:] -= torch.ger(err, Hinv1[j_loc, j_loc:])
@@ -212,9 +216,11 @@ class RotatedGPTQ:
             Losses[:, i1:i2] = Loss1 / 2
 
             if use_e8vq:
-                # cross-block group-mean (vectorized)
-                # Err1: (d_row, count) → (d_row//8, 8, count) → mean → expand
-                Err1_prop = Err1.reshape(-1, 8, Err1.shape[1])                                 .mean(dim=1, keepdim=True)                                 .expand(-1, 8, -1)                                 .reshape(self.d_row, -1)
+                # cross-block sign-magnitude propagation
+                Err1_r    = Err1.reshape(-1, 8, Err1.shape[1])           # (d_row//8, 8, count)
+                mag       = Err1_r.abs().mean(dim=1, keepdim=True)       # (d_row//8, 1, count)
+                sign      = Err1_r.sign()                                  # (d_row//8, 8, count)
+                Err1_prop = (sign * mag).reshape(self.d_row, -1)         # (d_row, count)
                 W[:, i2:] -= Err1_prop @ Hinv[i1:i2, i2:]
             else:
                 W[:, i2:] -= Err1 @ Hinv[i1:i2, i2:]
