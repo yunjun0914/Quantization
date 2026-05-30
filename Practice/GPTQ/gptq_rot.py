@@ -125,50 +125,47 @@ class RotatedGPTQ:
         #   err_j = W_rot[:, j] - W_q_z[:, j] ← Z-aware error (channel 방향 전파)
         scale_e8_layer = None
         W_q_z = None   # precomputed Z-aware recovered weights
-        if use_e8vq and VX is not None:
+        if use_e8vq:
             W_rot_za = W if (uwvt_mode and self.U is not None) else self._apply_U(W)
-            n_vx = VX.shape[1]
 
-            # R: (n, n) Hadamard for incoherence
-            from rotation import get_rotation
-            R    = get_rotation(n_vx, mode='hadamard', seed=42, device=VX.device)
-            VXRt = VX @ R.T                               # (d_col, n)
-
-            # Z' = UWXR^T
-            Z_prime  = W_rot_za @ VXRt                    # (d_row, n)
+            # Z' = W_rot @ H̃   (d_row, d_col) full rank
+            # H̃ = VHV^T 이미 계산됨, Cholesky 후 사용
+            # H̃^{-1} = Hinv^T @ Hinv
+            Z_prime  = W_rot_za @ H                       # (d_row, d_col)
             scale_za = (Z_prime.square().mean().sqrt() / 0.9).clamp(min=1e-8)
             scale_e8_layer = scale_za
 
-            # Q(Z'): vectorized E8P
-            Z_blocks = Z_prime.reshape(self.d_row // 8, 8, n_vx)
-            scale_g  = scale_za.reshape(-1, 1, 1)
-            Z_norm   = Z_blocks / scale_g
-            Z_flat   = Z_norm.permute(0, 2, 1).reshape(-1, 8)
-            pv, pe   = _e8p_fast_qpart(Z_flat + 0.25)
-            mv, me   = _e8p_fast_qpart(Z_flat - 0.25)
-            which    = (pe < me).unsqueeze(1)
-            q_flat   = torch.where(which, pv - 0.25, mv + 0.25)
-            Z_q      = (q_flat.reshape(self.d_row // 8, n_vx, 8)
-                              .permute(0, 2, 1)
-                              .reshape(self.d_row, n_vx) * scale_za)
-            del Z_prime, Z_blocks, Z_norm, Z_flat, q_flat
+            # Q(Z'): vectorized E8P (chunk 단위로 OOM 방지)
+            # Z_prime: (d_row, d_col)
+            # Z_flat 전체: (d_row//8 * d_col, 8) → OOM 가능
+            # chunk_size=128 columns씩 처리
+            n_cols    = self.d_col
+            chunk_sz  = 128
+            Z_q       = torch.zeros_like(Z_prime)
+            scale_g   = scale_za.reshape(-1, 1)               # (d_row//8, 1)
+            for c0 in range(0, n_cols, chunk_sz):
+                c1     = min(c0 + chunk_sz, n_cols)
+                Zc     = Z_prime[:, c0:c1]                    # (d_row, chunk)
+                Zc_blk = Zc.reshape(self.d_row // 8, 8, c1-c0)
+                Zc_nrm = Zc_blk / scale_g.unsqueeze(2)        # (g, 8, chunk)
+                Zc_flt = Zc_nrm.permute(0, 2, 1).reshape(-1, 8)
+                pv, pe = _e8p_fast_qpart(Zc_flt + 0.25)
+                mv, me = _e8p_fast_qpart(Zc_flt - 0.25)
+                which  = (pe < me).unsqueeze(1)
+                qc     = torch.where(which, pv - 0.25, mv + 0.25)
+                Z_q[:, c0:c1] = (qc.reshape(self.d_row // 8, c1-c0, 8)
+                                    .permute(0, 2, 1)
+                                    .reshape(self.d_row, c1-c0) * scale_za)
+            del Z_prime
 
-            # W_q_z 복원: Z_q @ VXRt^+
-            # VXRt^+ = (VXRt^T @ VXRt)^{-1} @ VXRt^T  (n×n full rank)
-            G      = VXRt.T @ VXRt                        # (n, n) full rank
-            damp_g = percdamp * G.diag().mean()
-            G_inv  = torch.linalg.inv(G + damp_g * torch.eye(n_vx, device=G.device))
-            W_q_z  = Z_q @ G_inv @ VXRt.T                # (d_row, d_col)
-            del Z_q, G, G_inv, VXRt, R
+            # W_q_z 복원: Z_q @ H̃^{-1} (exact, null space 없음)
+            H_inv = Hinv.T @ Hinv                         # (d_col, d_col)
+            W_q_z = Z_q @ H_inv                           # (d_row, d_col)
+            del Z_q, H_inv
 
             # scale: W_rot 기준
             scale_e8_layer = (W_rot_za.square().mean().sqrt() / 0.9).clamp(min=1e-8)
 
-            # W를 W_q_z로 초기화 (GPTQ 시작점)
-            if torch.isfinite(W_q_z).all():
-                W = W_q_z
-
-            # NaN/Inf 방지
             if not torch.isfinite(W_q_z).all():
                 W_q_z = None
 
