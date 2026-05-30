@@ -16,7 +16,7 @@ Rotated GPTQ Core v2
 import math
 import torch
 import torch.nn as nn
-from quantize import quantize, find_params, quantize_nf, find_params_nf, NF2_GRID, get_nf_grid, quantize_e8, quantize_e8_indexed, find_scale_e8, get_e8p_codebook
+from quantize import quantize, find_params, quantize_nf, find_params_nf, NF2_GRID, get_nf_grid, quantize_e8, quantize_e8_indexed, find_scale_e8, get_e8p_codebook, _e8p_fast_qpart
 
 
 class RotatedGPTQ:
@@ -97,6 +97,35 @@ class RotatedGPTQ:
         Hinv = torch.cholesky_inverse(L)
         Hinv = torch.linalg.cholesky(Hinv, upper=True)
 
+        # ── Z-aware W initialization ─────────────────────────────────────
+        # Z = W_rot @ VX → E8P(Z) → W = Z_q @ VX^T @ H̃^{-1}
+        # Hinv (upper Cholesky of H^{-1}): H^{-1} = Hinv^T @ Hinv
+        if use_e8vq and VX is not None:
+            W_rot_za = W if (uwvt_mode and self.U is not None) else self._apply_U(W)
+            Z_za     = W_rot_za @ VX                          # (d_row, n)
+            scale_za = (Z_za.square().mean().sqrt() / 0.9).clamp(min=1e-8)
+            scale_e8_layer = scale_za                         # Z scale 사용
+
+            # vectorized E8P on Z
+            n_vx     = VX.shape[1]
+            Z_blocks = Z_za.reshape(self.d_row // 8, 8, n_vx)
+            scale_g  = scale_za.reshape(-1, 1, 1)
+            Z_norm   = Z_blocks / scale_g
+            Z_flat   = Z_norm.permute(0, 2, 1).reshape(-1, 8)
+            pv, pe   = _e8p_fast_qpart(Z_flat + 0.25)
+            mv, me   = _e8p_fast_qpart(Z_flat - 0.25)
+            which    = (pe < me).unsqueeze(1)
+            q_flat   = torch.where(which, pv - 0.25, mv + 0.25)
+            Z_q      = (q_flat.reshape(self.d_row // 8, n_vx, 8)
+                              .permute(0, 2, 1)
+                              .reshape(self.d_row, n_vx) * scale_za)
+            del Z_za, Z_blocks, Z_norm, Z_flat, q_flat
+
+            # W 복원: H^{-1} = Hinv^T @ Hinv
+            H_inv = Hinv.T @ Hinv
+            W     = Z_q @ VX.T @ H_inv / n_vx
+            del Z_q, H_inv
+
         # ── actorder ─────────────────────────────────────────────────────
         if actorder:
             perm    = torch.argsort(torch.diag(H), descending=True)
@@ -116,40 +145,9 @@ class RotatedGPTQ:
         use_nf   = nf_grid is not None
         use_e8vq = self.use_e8    and (bits == 2) and (self.d_row % 8 == 0)
 
-        # E8P per-layer scalar scale (QuIP# 방식)
+        # E8P scale placeholder (Z-aware 블록에서 설정, 또는 fallback)
+        scale_e8_layer = None
         if use_e8vq:
-            # uwvt_mode: W가 이미 UWV^T → U 추가 불필요
-            W_rot_all = W if (uwvt_mode and self.U is not None) else self._apply_U(W)
-
-            if VX is not None:
-                # Z-aware quantization:
-                # 1. Z = UWX (d_row, n)
-                # 2. scale = RMS(Z) / 0.9
-                # 3. Z_q = E8P(Z)
-                # 4. W_init = Z_q @ VX^T @ H̃^{-1}  → GPTQ 초기값
-                Z_all = W_rot_all @ VX                # (d_row, n)
-                scale_e8_layer = (Z_all.square().mean().sqrt() / 0.9
-                                  ).clamp(min=1e-8).to(W.device)
-                scale_e8_exp = scale_e8_layer.expand(self.d_row // 8, 1)
-
-                # Z 직접 양자화
-                Z_q = torch.zeros_like(Z_all)
-                for _i in range(VX.shape[1]):
-                    col_z = Z_all[:, _i:_i+1]
-                    Z_q[:, _i:_i+1] = quantize_e8(
-                        col_z, scale_e8_exp.to(col_z.dtype)
-                    )
-                del Z_all
-
-                # W 복원: Z_q @ VX^T @ H̃^{-1}
-                # H̃^{-1} = Hinv^T @ Hinv (Cholesky 후 계산) → 여기선 직접 inv
-                n_vx = VX.shape[1]
-                H_inv_local = torch.linalg.inv(H + 1e-8 * torch.eye(self.d_col, device=H.device))
-                W = Z_q @ VX.T @ H_inv_local / n_vx
-                del Z_q, H_inv_local
-            else:
-                scale_e8_layer = (W_rot_all.square().mean().sqrt() / 0.9
-                                  ).clamp(min=1e-8).to(W.device)
             idx_col_list = []
 
         if groupsize <= 0:
