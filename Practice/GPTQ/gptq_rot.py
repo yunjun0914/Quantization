@@ -86,6 +86,15 @@ class RotatedGPTQ:
         diag_idx = torch.arange(self.d_col, device=self.dev)
         H[diag_idx, diag_idx] += damp_val
 
+        # row_dep: Cholesky 전에 H̃ 보관
+        # H_row_eff = W_rot @ H̃ @ W_rot^T (d_row × d_row)
+        # Cholesky 후에는 H가 수정되므로 미리 계산
+        if use_e8vq and getattr(self, 'row_dep', False):
+            W_rot_for_hrow = W if (uwvt_mode and self.U is not None) else self._apply_U(W)
+            H_row_eff = W_rot_for_hrow @ H @ W_rot_for_hrow.T  # (d_row, d_row)
+        else:
+            H_row_eff = None
+
         L    = torch.linalg.cholesky(H)
         Hinv = torch.cholesky_inverse(L)
         Hinv = torch.linalg.cholesky(Hinv, upper=True)
@@ -133,20 +142,17 @@ class RotatedGPTQ:
         Losses = torch.zeros_like(W)
 
         # ── Algorithm 1 ──────────────────────────────────────────────────
-        # E8 block-GPTQ: E8P의 8D row 구조에 맞춰 8개 column씩 block 처리
-        # scalar: err (d_row,) × Hinv[j, j+:] → outer product
-        # block:  E_G (d_row, 8) @ Hinv_GG^{-1} @ Hinv_GR → block propagation
-        e8_block = 8 if use_e8vq else blocksize  # E8P일 때만 block=8 적용
-
-        for i1 in range(0, self.d_col, e8_block if use_e8vq else blocksize):
-            i2    = min(i1 + (e8_block if use_e8vq else blocksize), self.d_col)
+        for i1 in range(0, self.d_col, blocksize):
+            i2    = min(i1 + blocksize, self.d_col)
             count = i2 - i1
 
             W1    = W[:, i1:i2].clone()
             Q1    = torch.zeros_like(W1)
             Err1  = torch.zeros_like(W1)
             Loss1 = torch.zeros_like(W1)
-            Hinv1 = Hinv[i1:i2, i1:i2]  # (block, block)
+            Hinv1 = Hinv[i1:i2, i1:i2]
+
+
 
             for j_loc in range(count):
                 j_global = i1 + j_loc
@@ -201,28 +207,27 @@ class RotatedGPTQ:
 
                 Q1[:, j_loc]    = q
                 Loss1[:, j_loc] = err ** 2
-                W1[:, j_loc:]  -= torch.ger(err, Hinv1[j_loc, j_loc:])
+
+                if use_e8vq and getattr(self, 'row_dep', False) and H_row_eff is not None:
+                    # Row-dependent propagation
+                    # L = ||(Ŵ-W) W_rot X||²_F = tr(E · W_rot H̃ W_rot^T · E^T)
+                    # H_row_eff = W_rot @ H̃ @ W_rot^T (precomputed)
+                    # per 8-row block: e_norm = H_row_eff[k:k+8, k:k+8]^{-1} @ e_g
+                    err_dep = err.clone()
+                    for k in range(0, self.d_row, 8):
+                        e_g = err[k:k+8]                     # (8,)
+                        H_g = H_row_eff[k:k+8, k:k+8]       # (8, 8) W_rot H̃ W_rot^T block
+                        H_g = H_g + 1e-6 * torch.eye(8, device=H_g.device)
+                        err_dep[k:k+8] = torch.linalg.solve(H_g, e_g)
+                    W1[:, j_loc:] -= torch.ger(err_dep, Hinv1[j_loc, j_loc:])
+                else:
+                    W1[:, j_loc:] -= torch.ger(err, Hinv1[j_loc, j_loc:])
+
                 Err1[:, j_loc]  = err
 
             Q[:, i1:i2]      = Q1
             Losses[:, i1:i2] = Loss1 / 2
-
-            if use_e8vq and count == e8_block and i2 < self.d_col:
-                # E8 block-GPTQ: block 단위 오차 전파
-                # E_G = Err1 (d_row, 8), Hinv1 = (8,8) upper triangular
-                # E_norm = E_G @ Hinv1^{-1}: solve upper triangular system
-                # W[:, i2:] -= E_norm @ Hinv[i1:i2, i2:]
-                Hinv_GR = Hinv[i1:i2, i2:]  # (8, remaining)
-                # Hinv1이 upper triangular: torch.triangular_solve 사용
-                E_norm = torch.linalg.solve_triangular(
-                    Hinv1,
-                    Err1.T,       # (8, d_row)
-                    upper=True
-                ).T               # (d_row, 8)
-                W[:, i2:] -= E_norm @ Hinv_GR
-            else:
-                # scalar GPTQ: 기존 방식
-                W[:, i2:] -= Err1 @ Hinv[i1:i2, i2:]
+            W[:, i2:]       -= Err1 @ Hinv[i1:i2, i2:]
 
         if actorder:
             Q = Q[:, invperm]
