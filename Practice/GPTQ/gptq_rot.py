@@ -86,9 +86,6 @@ class RotatedGPTQ:
         diag_idx = torch.arange(self.d_col, device=self.dev)
         H[diag_idx, diag_idx] += damp_val
 
-        # row_dep: H̃ 보관 (Cholesky 전, H가 수정되기 전에 저장)
-        H_for_rowdep = H.clone() if getattr(self, 'row_dep', False) else None
-
         L    = torch.linalg.cholesky(H)
         Hinv = torch.cholesky_inverse(L)
         Hinv = torch.linalg.cholesky(Hinv, upper=True)
@@ -111,15 +108,6 @@ class RotatedGPTQ:
         nf_grid  = get_nf_grid(bits)   # 2→NF2, 3→NF8, 4→NF16, else None
         use_nf   = nf_grid is not None
         use_e8vq = self.use_e8    and (bits == 2) and (self.d_row % 8 == 0)
-
-        # H_row_eff = W_rot @ H̃ @ W_rot^T (d_row × d_row)
-        # loss = ||(Ŵ-W) W_rot X||²_F = tr(E · H_row_eff · E^T)
-        if use_e8vq and getattr(self, 'row_dep', False) and H_for_rowdep is not None:
-            W_rot_for_hrow = W if (uwvt_mode and self.U is not None) else self._apply_U(W)
-            H_row_eff = W_rot_for_hrow @ H_for_rowdep @ W_rot_for_hrow.T  # (d_row, d_row)
-            del H_for_rowdep
-        else:
-            H_row_eff = None
 
         # E8P per-layer scalar scale (QuIP# 방식)
         if use_e8vq:
@@ -210,18 +198,15 @@ class RotatedGPTQ:
                 Q1[:, j_loc]    = q
                 Loss1[:, j_loc] = err ** 2
 
-                if use_e8vq and getattr(self, 'row_dep', False) and H_row_eff is not None:
-                    # Row-dependent propagation
-                    # L = ||(Ŵ-W) W_rot X||²_F = tr(E · W_rot H̃ W_rot^T · E^T)
-                    # H_row_eff = W_rot @ H̃ @ W_rot^T (precomputed)
-                    # per 8-row block: e_norm = H_row_eff[k:k+8, k:k+8]^{-1} @ e_g
-                    err_dep = err.clone()
+                if use_e8vq:
+                    # E8P group-mean error propagation
+                    # E8P가 row 8개를 jointly 양자화 → 오차도 group 단위로 균등화
+                    # e_G.mean()으로 group 내 오차를 균등화 → E8P joint 구조 반영
+                    err_prop = err.clone()
                     for k in range(0, self.d_row, 8):
-                        e_g = err[k:k+8]                     # (8,)
-                        H_g = H_row_eff[k:k+8, k:k+8]       # (8, 8) W_rot H̃ W_rot^T block
-                        H_g = H_g + 1e-6 * torch.eye(8, device=H_g.device)
-                        err_dep[k:k+8] = torch.linalg.solve(H_g, e_g)
-                    W1[:, j_loc:] -= torch.ger(err_dep, Hinv1[j_loc, j_loc:])
+                        e_G = err[k:k+8]
+                        err_prop[k:k+8] = e_G.mean().expand(8)
+                    W1[:, j_loc:] -= torch.ger(err_prop, Hinv1[j_loc, j_loc:])
                 else:
                     W1[:, j_loc:] -= torch.ger(err, Hinv1[j_loc, j_loc:])
 
@@ -229,7 +214,15 @@ class RotatedGPTQ:
 
             Q[:, i1:i2]      = Q1
             Losses[:, i1:i2] = Loss1 / 2
-            W[:, i2:]       -= Err1 @ Hinv[i1:i2, i2:]
+
+            if use_e8vq:
+                # cross-block도 group-mean error propagation
+                Err1_prop = Err1.clone()
+                for k in range(0, self.d_row, 8):
+                    Err1_prop[k:k+8, :] = Err1[k:k+8, :].mean(dim=0, keepdim=True).expand(8, -1)
+                W[:, i2:] -= Err1_prop @ Hinv[i1:i2, i2:]
+            else:
+                W[:, i2:] -= Err1 @ Hinv[i1:i2, i2:]
 
         if actorder:
             Q = Q[:, invperm]

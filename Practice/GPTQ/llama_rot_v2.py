@@ -128,8 +128,6 @@ def llama_rot_sequential_v2(
             name: RotatedGPTQ(lin, *rotations[name], restore_u=(not v1_mode), use_e8=use_e8)
             for name, lin in linears.items() if name in rotations
         }
-        if row_dep:
-            for h in handlers.values(): h.row_dep = True
 
         hooks = []
         for name, lin in linears.items():
@@ -285,7 +283,7 @@ def run_llama_rot_v2(
         model, trainloader, dev,
         bits=bits, blocksize=blocksize, percdamp=percdamp,
         groupsize=groupsize, sym=sym, actorder=actorder,
-        rot_mode=rot_mode, seed=seed, use_u=use_u, v1_mode=v1_mode, use_e8=use_e8, uwvt_mode=uwvt_mode, row_dep=row_dep,
+        rot_mode=rot_mode, seed=seed, use_u=use_u, v1_mode=v1_mode, use_e8=use_e8, uwvt_mode=uwvt_mode,
         export=export,
     )
     print(f"\n[RotatedGPTQ v2] Total time: {time.time()-t0:.1f}s")
