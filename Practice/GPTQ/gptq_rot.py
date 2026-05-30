@@ -97,14 +97,34 @@ class RotatedGPTQ:
         Hinv = torch.cholesky_inverse(L)
         Hinv = torch.linalg.cholesky(Hinv, upper=True)
 
+        # ── actorder ─────────────────────────────────────────────────────
+        if actorder:
+            perm    = torch.argsort(torch.diag(H), descending=True)
+            W       = W[:, perm]
+            Hinv    = Hinv[:, perm][perm, :]
+            invperm = torch.argsort(perm)
+        else:
+            perm = invperm = None
+
+        # ── groupsize ────────────────────────────────────────────────────
+        maxq     = 2 ** bits - 1
+        n_groups = math.ceil(self.d_col / groupsize) if groupsize > 0 else 1
+        scale_all = torch.zeros((self.d_row, n_groups), device=self.dev)
+        zero_all  = torch.zeros((self.d_row, n_groups), device=self.dev)
+
+        nf_grid  = get_nf_grid(bits)   # 2→NF2, 3→NF8, 4→NF16, else None
+        use_nf   = nf_grid is not None
+        use_e8vq = self.use_e8    and (bits == 2) and (self.d_row % 8 == 0)
+
         # ── Z-aware W initialization ─────────────────────────────────────
         # Z = W_rot @ VX → E8P(Z) → W = Z_q @ VX^T @ H̃^{-1}
-        # Hinv (upper Cholesky of H^{-1}): H^{-1} = Hinv^T @ Hinv
+        # Hinv 재활용: H^{-1} = Hinv^T @ Hinv
+        scale_e8_layer = None
         if use_e8vq and VX is not None:
             W_rot_za = W if (uwvt_mode and self.U is not None) else self._apply_U(W)
             Z_za     = W_rot_za @ VX                          # (d_row, n)
             scale_za = (Z_za.square().mean().sqrt() / 0.9).clamp(min=1e-8)
-            scale_e8_layer = scale_za                         # Z scale 사용
+            scale_e8_layer = scale_za
 
             # vectorized E8P on Z
             n_vx     = VX.shape[1]
@@ -126,27 +146,11 @@ class RotatedGPTQ:
             W     = Z_q @ VX.T @ H_inv / n_vx
             del Z_q, H_inv
 
-        # ── actorder ─────────────────────────────────────────────────────
-        if actorder:
-            perm    = torch.argsort(torch.diag(H), descending=True)
-            W       = W[:, perm]
-            Hinv    = Hinv[:, perm][perm, :]
-            invperm = torch.argsort(perm)
-        else:
-            perm = invperm = None
+        if use_e8vq and scale_e8_layer is None:
+            # VX 없을 때 fallback: W_rot RMS
+            W_rot_all = W if (uwvt_mode and self.U is not None) else self._apply_U(W)
+            scale_e8_layer = (W_rot_all.square().mean().sqrt() / 0.9).clamp(min=1e-8)
 
-        # ── groupsize ────────────────────────────────────────────────────
-        maxq     = 2 ** bits - 1
-        n_groups = math.ceil(self.d_col / groupsize) if groupsize > 0 else 1
-        scale_all = torch.zeros((self.d_row, n_groups), device=self.dev)
-        zero_all  = torch.zeros((self.d_row, n_groups), device=self.dev)
-
-        nf_grid  = get_nf_grid(bits)   # 2→NF2, 3→NF8, 4→NF16, else None
-        use_nf   = nf_grid is not None
-        use_e8vq = self.use_e8    and (bits == 2) and (self.d_row % 8 == 0)
-
-        # E8P scale placeholder (Z-aware 블록에서 설정, 또는 fallback)
-        scale_e8_layer = None
         if use_e8vq:
             idx_col_list = []
 
