@@ -82,8 +82,14 @@ def llama_rot_sequential_v2(
         "mlp.up_proj":      (U_gu if use_u else None, V),
         "mlp.down_proj":    (U_d  if use_u else None, U_gu),
     }
-    # CPU 복사본 (export/inference용, GPU 메모리 분리)
-    def _cpu(t): return t.cpu() if t is not None else None
+    # CPU 복사본 (export/inference용, 같은 tensor 공유)
+    _cpu_cache = {}
+    def _cpu(t):
+        if t is None: return None
+        tid = id(t)
+        if tid not in _cpu_cache:
+            _cpu_cache[tid] = t.cpu()
+        return _cpu_cache[tid]
     rotations_cpu = {k: (_cpu(u), _cpu(v)) for k, (u, v) in rotations.items()}
 
     # ── 입력 캡처 ─────────────────────────────────────────────────────────
@@ -336,9 +342,14 @@ def run_llama_rot_v2(
         del results
         import gc; gc.collect()
 
-        # fake quant 모델을 그대로 E8PLinear로 교체 (새로 로드 안 함)
+        # fake quant model 완전 해제 (LayerNorm이 변형됐으므로 재사용 불가)
         model = model.cpu()
-        model_real = model
+        del model
+        import gc; gc.collect()
+        torch.cuda.empty_cache()
+
+        # original model 새로 로드 (clean state)
+        model_real = LlamaForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16)
         if quantized_layers:
             # rotations: layer별 U 정보 전달
             V_cpu = rotations_cpu['self_attn.q_proj'][1]  # globally shared V cpu
