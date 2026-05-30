@@ -52,11 +52,13 @@ class RotatedGPTQ:
             inp = self.V.unsqueeze(1) * inp  # elementwise: 1D V
         n   = inp.shape[1]
         self.H = (self.nsamples * self.H + 2 * inp @ inp.t()) / (self.nsamples + n)
-        # VX 축적: Z = W_rot @ VX 계산용
+        # VX 축적: Z = W_rot @ VX 계산용 (최대 256 columns)
+        _VX_MAX = 256
         if self.VX is None:
-            self.VX = inp.detach()
-        else:
-            self.VX = torch.cat([self.VX, inp.detach()], dim=1)
+            self.VX = inp.detach().cpu()[:, :_VX_MAX]
+        elif self.VX.shape[1] < _VX_MAX:
+            remaining = _VX_MAX - self.VX.shape[1]
+            self.VX = torch.cat([self.VX, inp.detach().cpu()[:, :remaining]], dim=1)
         self.nsamples += n
 
     def quantize(
@@ -81,7 +83,7 @@ class RotatedGPTQ:
         if uwvt_mode and self.U is not None:
             W = self._apply_U(W)   # UWV^T 공간
         H = self.H.float()                           # H̃ = VHV^T
-        VX = self.VX.float() if self.VX is not None else None  # (d_col, n)
+        VX = self.VX.float().to(W.device) if self.VX is not None else None  # (d_col, n)
 
         # ── dead weight ───────────────────────────────────────────────────
         dead = (torch.diag(H) == 0)
