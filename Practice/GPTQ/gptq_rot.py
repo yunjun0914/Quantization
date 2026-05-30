@@ -199,13 +199,9 @@ class RotatedGPTQ:
                 Loss1[:, j_loc] = err ** 2
 
                 if use_e8vq:
-                    # E8P group-mean error propagation
-                    # E8P가 row 8개를 jointly 양자화 → 오차도 group 단위로 균등화
-                    # e_G.mean()으로 group 내 오차를 균등화 → E8P joint 구조 반영
-                    err_prop = err.clone()
-                    for k in range(0, self.d_row, 8):
-                        e_G = err[k:k+8]
-                        err_prop[k:k+8] = e_G.mean().expand(8)
+                    # E8P group-mean error propagation (vectorized)
+                    # err: (d_row,) → reshape (d_row//8, 8) → mean → expand
+                    err_prop = err.reshape(-1, 8).mean(dim=1, keepdim=True).expand(-1, 8).reshape(-1)
                     W1[:, j_loc:] -= torch.ger(err_prop, Hinv1[j_loc, j_loc:])
                 else:
                     W1[:, j_loc:] -= torch.ger(err, Hinv1[j_loc, j_loc:])
@@ -216,10 +212,9 @@ class RotatedGPTQ:
             Losses[:, i1:i2] = Loss1 / 2
 
             if use_e8vq:
-                # cross-block도 group-mean error propagation
-                Err1_prop = Err1.clone()
-                for k in range(0, self.d_row, 8):
-                    Err1_prop[k:k+8, :] = Err1[k:k+8, :].mean(dim=0, keepdim=True).expand(8, -1)
+                # cross-block group-mean (vectorized)
+                # Err1: (d_row, count) → (d_row//8, 8, count) → mean → expand
+                Err1_prop = Err1.reshape(-1, 8, Err1.shape[1])                                 .mean(dim=1, keepdim=True)                                 .expand(-1, 8, -1)                                 .reshape(self.d_row, -1)
                 W[:, i2:] -= Err1_prop @ Hinv[i1:i2, i2:]
             else:
                 W[:, i2:] -= Err1 @ Hinv[i1:i2, i2:]
