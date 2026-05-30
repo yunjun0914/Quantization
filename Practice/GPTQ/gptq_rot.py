@@ -153,12 +153,16 @@ class RotatedGPTQ:
                               .reshape(self.d_row, n_vx) * scale_za)
             del Z_prime, Z_blocks, Z_norm, Z_flat, q_flat
 
-            # W_q_z 복원: Q(Z') @ VXRt^T @ H̃^{-1}
-            H_inv = Hinv.T @ Hinv                         # (d_col, d_col)
-            W_q_z = Z_q @ VXRt.T @ H_inv                 # (d_row, d_col)
-            del Z_q, H_inv, VXRt, R
+            # W_q_z 복원: Q(Z') @ VXRt^+
+            # VXRt^+ = VXRt^T @ (VXRt @ VXRt^T)^{-1}
+            # Hessian 불필요, pseudoinverse로 직접 복원
+            G      = VXRt @ VXRt.T                        # (d_col, d_col)
+            damp_g = percdamp * G.diag().mean()
+            G_inv  = torch.linalg.inv(G + damp_g * torch.eye(self.d_col, device=G.device))
+            W_q_z  = Z_q @ VXRt.T @ G_inv                # (d_row, d_col)
+            del Z_q, G, G_inv, VXRt, R
 
-            # scale: 복원된 W_q_z 기준
+            # scale: W_rot 기준
             scale_e8_layer = (W_rot_za.square().mean().sqrt() / 0.9).clamp(min=1e-8)
 
             # NaN/Inf 방지
