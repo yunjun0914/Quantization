@@ -118,60 +118,52 @@ class RotatedGPTQ:
         use_nf   = nf_grid is not None
         use_e8vq = self.use_e8    and (bits == 2) and (self.d_row % 8 == 0)
 
-        # ── Z' space GPTQ ────────────────────────────────────────────────
-        # Z' = W_rot @ VXRt = UWXR^T  (incoherent output space)
-        # H_s = VXRt^T @ VXRt (n×n, 한 번만 계산)
-        # GPTQ in Z' space → 복원: W_rot = Z'_q @ VXRt^T @ H̃^{-1}
+        # ── Z-aware precompute ───────────────────────────────────────────
+        # Z' = UWXR^T → Q(Z') → W_q_z 복원 (precomputed)
+        # GPTQ inner loop에서:
+        #   q_j   = E8P(W_rot[:, j])         ← index 저장용
+        #   err_j = W_rot[:, j] - W_q_z[:, j] ← Z-aware error (channel 방향 전파)
         scale_e8_layer = None
+        W_q_z = None   # precomputed Z-aware recovered weights
         if use_e8vq and VX is not None:
             W_rot_za = W if (uwvt_mode and self.U is not None) else self._apply_U(W)
             n_vx = VX.shape[1]
 
-            # R: (n, n) Hadamard for incoherence (UWXR^T)
+            # R: (n, n) Hadamard for incoherence
             from rotation import get_rotation
             R    = get_rotation(n_vx, mode='hadamard', seed=42, device=VX.device)
             VXRt = VX @ R.T                               # (d_col, n)
 
             # Z' = UWXR^T
-            Z_prime = W_rot_za @ VXRt                     # (d_row, n)
+            Z_prime  = W_rot_za @ VXRt                    # (d_row, n)
             scale_za = (Z_prime.square().mean().sqrt() / 0.9).clamp(min=1e-8)
             scale_e8_layer = scale_za
 
-            # H_s = VXRt^T @ VXRt (n×n) - 한 번만 계산
-            H_s      = VXRt.T @ VXRt                      # (n, n)
-            damp_s   = percdamp * H_s.diag().mean()
-            H_s      = H_s + damp_s * torch.eye(n_vx, device=H_s.device)
-            L_s      = torch.linalg.cholesky(H_s)
-            Hinv_s   = torch.cholesky_inverse(L_s)
-            Hinv_s   = torch.linalg.cholesky(Hinv_s, upper=True)  # (n, n)
-            del H_s, L_s
+            # Q(Z'): vectorized E8P
+            Z_blocks = Z_prime.reshape(self.d_row // 8, 8, n_vx)
+            scale_g  = scale_za.reshape(-1, 1, 1)
+            Z_norm   = Z_blocks / scale_g
+            Z_flat   = Z_norm.permute(0, 2, 1).reshape(-1, 8)
+            pv, pe   = _e8p_fast_qpart(Z_flat + 0.25)
+            mv, me   = _e8p_fast_qpart(Z_flat - 0.25)
+            which    = (pe < me).unsqueeze(1)
+            q_flat   = torch.where(which, pv - 0.25, mv + 0.25)
+            Z_q      = (q_flat.reshape(self.d_row // 8, n_vx, 8)
+                              .permute(0, 2, 1)
+                              .reshape(self.d_row, n_vx) * scale_za)
+            del Z_prime, Z_blocks, Z_norm, Z_flat, q_flat
 
-            # GPTQ in Z' space (sample 방향, n개 column)
-            Z_q = torch.zeros_like(Z_prime)
-            for i in range(n_vx):
-                col_z = Z_prime[:, i:i+1]                 # (d_row, 1)
-                scale_col = scale_za.expand(self.d_row // 8, 1)
-                q_z   = quantize_e8(col_z, scale_col.to(col_z.dtype))
-                err_z = (Z_prime[:, i] - q_z.squeeze(1)) / Hinv_s[i, i]
-                Z_q[:, i] = q_z.squeeze(1)
-                if i < n_vx - 1:
-                    Z_prime[:, i+1:] -= torch.ger(err_z, Hinv_s[i, i+1:])
-            del Z_prime, Hinv_s
-
-            # 복원: W_rot = Z'_q @ VXRt^T @ H̃^{-1}
+            # W_q_z 복원: Q(Z') @ VXRt^T @ H̃^{-1}
             H_inv = Hinv.T @ Hinv                         # (d_col, d_col)
-            W     = Z_q @ VXRt.T @ H_inv
+            W_q_z = Z_q @ VXRt.T @ H_inv                 # (d_row, d_col)
             del Z_q, H_inv, VXRt, R
 
-            # scale 재계산: 복원된 W 기준
-            scale_e8_layer = (W.square().mean().sqrt() / 0.9).clamp(min=1e-8)
+            # scale: 복원된 W_q_z 기준
+            scale_e8_layer = (W_rot_za.square().mean().sqrt() / 0.9).clamp(min=1e-8)
 
             # NaN/Inf 방지
-            if not torch.isfinite(W).all():
-                W = self.layer.weight.data.clone().float()
-                if uwvt_mode and self.U is not None:
-                    W = self._apply_U(W)
-                scale_e8_layer = None
+            if not torch.isfinite(W_q_z).all():
+                W_q_z = None
 
         if use_e8vq and scale_e8_layer is None:
             W_rot_all = W if (uwvt_mode and self.U is not None) else self._apply_U(W)
@@ -250,7 +242,11 @@ class RotatedGPTQ:
 
                 if uwvt_mode and self.U is not None:
                     q   = q_rot
-                    err = (col_rot - q_rot) / d
+                    if use_e8vq and W_q_z is not None:
+                        # Z-aware error: UWV^T[:, j] - W_q_z[:, j]
+                        err = (col_rot - W_q_z[:, j_global]) / d
+                    else:
+                        err = (col_rot - q_rot) / d
                 elif self.restore_u:
                     q   = self._apply_Ut(q_rot.unsqueeze(1)).squeeze(1)
                     err = (col - q) / d
