@@ -27,6 +27,6 @@ python -u main_llama.py \
     --e8 \
     --uwvt \
     --compare \
-    --e8_scale 1 \
+    --e8_scale 0.02 \
     --percdamp 0.01 \
     --dev cuda:0 
