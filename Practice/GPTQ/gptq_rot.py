@@ -112,12 +112,6 @@ class RotatedGPTQ:
         use_nf   = nf_grid is not None
         use_e8vq = self.use_e8    and (bits == 2) and (self.d_row % 8 == 0)
 
-        # ── Z-aware precompute ───────────────────────────────────────────
-        # Z' = UWXR^T → Q(Z') → W_q_z 복원 (precomputed)
-        # GPTQ inner loop에서:
-        #   q_j   = E8P(W_rot[:, j])         ← index 저장용
-        #   err_j = W_rot[:, j] - W_q_z[:, j] ← Z-aware error (channel 방향 전파)
-        scale_e8_layer = None
         # E8P per-layer scalar scale (QuIP# 방식)
         if use_e8vq:
             W_rot_all = W if (uwvt_mode and self.U is not None) else self._apply_U(W)
@@ -179,9 +173,9 @@ class RotatedGPTQ:
                     col_rot = self._apply_U(col.unsqueeze(1))
 
                 if use_e8vq:
-                    # Hessian-aware E8P scale: H̃^{-1}[j,j] = d
-                    # d 큰 column (중요) → scale 작게 → resolution 높게
-                    scale_e8_col = (scale_e8_layer / d.sqrt().clamp(min=1e-8)
+                    # Hessian-aware E8P: H̃^{-1}[j,j]=d 작을수록 중요한 column
+                    # scale * sqrt(d) → d 작으면 scale 작아져서 resolution 높아짐
+                    scale_e8_col = (scale_e8_layer * d.sqrt().clamp(min=1e-8)
                                     ).expand(self.d_row // 8, 1)
                     if getattr(self, 'export_mode', False):
                         q_rot, _idx = quantize_e8_indexed(col_rot, scale_e8_col.to(col_rot.dtype))
