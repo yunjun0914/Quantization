@@ -16,7 +16,7 @@ Rotated GPTQ Core v2
 import math
 import torch
 import torch.nn as nn
-from quantize import quantize, find_params, quantize_nf, find_params_nf, NF2_GRID, get_nf_grid, quantize_e8, quantize_e8_indexed, find_scale_e8, get_e8p_codebook, _e8p_fast_qpart
+from quantize import quantize, find_params, quantize_nf, find_params_nf, NF2_GRID, get_nf_grid, quantize_e8, quantize_e8_indexed, find_scale_e8, get_e8p_codebook
 
 
 class RotatedGPTQ:
@@ -35,7 +35,7 @@ class RotatedGPTQ:
         self.V = V.to(self.dev).float()
 
         self.H        = torch.zeros((self.d_col, self.d_col), device=self.dev)
-        self.VX       = None   # (d_col, n) - for Z-aware quantization
+
         self.nsamples = 0
 
     def add_batch(self, inp: torch.Tensor, out: torch.Tensor):
@@ -52,13 +52,7 @@ class RotatedGPTQ:
             inp = self.V.unsqueeze(1) * inp  # elementwise: 1D V
         n   = inp.shape[1]
         self.H = (self.nsamples * self.H + 2 * inp @ inp.t()) / (self.nsamples + n)
-        # VX 축적: Z = W_rot @ VX 계산용 (최대 256 columns)
-        _VX_MAX = 256
-        if self.VX is None:
-            self.VX = inp.detach().cpu()[:, :_VX_MAX]
-        elif self.VX.shape[1] < _VX_MAX:
-            remaining = _VX_MAX - self.VX.shape[1]
-            self.VX = torch.cat([self.VX, inp.detach().cpu()[:, :remaining]], dim=1)
+
         self.nsamples += n
 
     def quantize(
@@ -83,7 +77,7 @@ class RotatedGPTQ:
         if uwvt_mode and self.U is not None:
             W = self._apply_U(W)   # UWV^T 공간
         H = self.H.float()                           # H̃ = VHV^T
-        VX = self.VX.float().to(W.device) if self.VX is not None else None  # (d_col, n)
+
 
         # ── dead weight ───────────────────────────────────────────────────
         dead = (torch.diag(H) == 0)
@@ -124,56 +118,11 @@ class RotatedGPTQ:
         #   q_j   = E8P(W_rot[:, j])         ← index 저장용
         #   err_j = W_rot[:, j] - W_q_z[:, j] ← Z-aware error (channel 방향 전파)
         scale_e8_layer = None
-        W_q_z = None   # precomputed Z-aware recovered weights
+        # E8P per-layer scalar scale (QuIP# 방식)
         if use_e8vq:
-            W_rot_za = W if (uwvt_mode and self.U is not None) else self._apply_U(W)
-
-            # Z' = W_rot @ H̃   (d_row, d_col) full rank
-            # H̃ = VHV^T 이미 계산됨, Cholesky 후 사용
-            # H̃^{-1} = Hinv^T @ Hinv
-            Z_prime  = W_rot_za @ H                       # (d_row, d_col)
-            scale_za = (Z_prime.square().mean().sqrt() / 0.9).clamp(min=1e-8)
-            scale_e8_layer = scale_za
-
-            # Q(Z'): vectorized E8P (chunk 단위로 OOM 방지)
-            # Z_prime: (d_row, d_col)
-            # Z_flat 전체: (d_row//8 * d_col, 8) → OOM 가능
-            # chunk_size=128 columns씩 처리
-            n_cols    = self.d_col
-            chunk_sz  = 128
-            Z_q       = torch.zeros_like(Z_prime)
-            scale_g   = scale_za.reshape(-1, 1)               # (d_row//8, 1)
-            for c0 in range(0, n_cols, chunk_sz):
-                c1     = min(c0 + chunk_sz, n_cols)
-                Zc     = Z_prime[:, c0:c1]                    # (d_row, chunk)
-                Zc_blk = Zc.reshape(self.d_row // 8, 8, c1-c0)
-                Zc_nrm = Zc_blk / scale_g.unsqueeze(2)        # (g, 8, chunk)
-                Zc_flt = Zc_nrm.permute(0, 2, 1).reshape(-1, 8)
-                pv, pe = _e8p_fast_qpart(Zc_flt + 0.25)
-                mv, me = _e8p_fast_qpart(Zc_flt - 0.25)
-                which  = (pe < me).unsqueeze(1)
-                qc     = torch.where(which, pv - 0.25, mv + 0.25)
-                Z_q[:, c0:c1] = (qc.reshape(self.d_row // 8, c1-c0, 8)
-                                    .permute(0, 2, 1)
-                                    .reshape(self.d_row, c1-c0) * scale_za)
-            del Z_prime
-
-            # W_q_z 복원: Z_q @ H̃^{-1} (exact, null space 없음)
-            H_inv = Hinv.T @ Hinv                         # (d_col, d_col)
-            W_q_z = Z_q @ H_inv                           # (d_row, d_col)
-            del Z_q, H_inv
-
-            # scale: W_rot 기준
-            scale_e8_layer = (W_rot_za.square().mean().sqrt() / 0.9).clamp(min=1e-8)
-
-            if not torch.isfinite(W_q_z).all():
-                W_q_z = None
-
-        if use_e8vq and scale_e8_layer is None:
             W_rot_all = W if (uwvt_mode and self.U is not None) else self._apply_U(W)
-            scale_e8_layer = (W_rot_all.square().mean().sqrt() / 0.9).clamp(min=1e-8)
-
-        if use_e8vq:
+            scale_e8_layer = (W_rot_all.square().mean().sqrt() / 0.9
+                              ).clamp(min=1e-8).to(W.device)
             idx_col_list = []
 
         if groupsize <= 0:
@@ -246,10 +195,7 @@ class RotatedGPTQ:
 
                 if uwvt_mode and self.U is not None:
                     q   = q_rot
-                    if use_e8vq and W_q_z is not None:
-                        err = (col_rot - W_q_z[:, j_global]) / d
-                    else:
-                        err = (col_rot - q_rot) / d
+                    err = (col_rot - q_rot) / d
                 elif self.restore_u:
                     q   = self._apply_Ut(q_rot.unsqueeze(1)).squeeze(1)
                     err = (col - q) / d
