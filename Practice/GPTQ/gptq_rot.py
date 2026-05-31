@@ -179,7 +179,10 @@ class RotatedGPTQ:
                     col_rot = self._apply_U(col.unsqueeze(1))
 
                 if use_e8vq:
-                    scale_e8_col = scale_e8_layer.expand(self.d_row // 8, 1)
+                    # Hessian-aware E8P scale: H̃^{-1}[j,j] = d
+                    # d 큰 column (중요) → scale 작게 → resolution 높게
+                    scale_e8_col = (scale_e8_layer / d.sqrt().clamp(min=1e-8)
+                                    ).expand(self.d_row // 8, 1)
                     if getattr(self, 'export_mode', False):
                         q_rot, _idx = quantize_e8_indexed(col_rot, scale_e8_col.to(col_rot.dtype))
                         idx_col_list.append(_idx.cpu())
