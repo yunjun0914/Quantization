@@ -128,6 +128,7 @@ def llama_rot_sequential_v2(
             name: RotatedGPTQ(lin, *rotations[name], restore_u=(not v1_mode), use_e8=use_e8)
             for name, lin in linears.items() if name in rotations
         }
+        for h in handlers.values(): h.e8_scale = e8_scale
 
         hooks = []
         for name, lin in linears.items():

@@ -115,7 +115,8 @@ class RotatedGPTQ:
         # E8P per-layer scalar scale (QuIP# 방식)
         if use_e8vq:
             W_rot_all = W if (uwvt_mode and self.U is not None) else self._apply_U(W)
-            scale_e8_layer = (W_rot_all.square().mean().sqrt() / 0.9
+            _e8_sf = getattr(self, 'e8_scale', 0.9)
+            scale_e8_layer = (W_rot_all.square().mean().sqrt() / _e8_sf
                               ).clamp(min=1e-8).to(W.device)
             idx_col_list = []
 
@@ -173,10 +174,7 @@ class RotatedGPTQ:
                     col_rot = self._apply_U(col.unsqueeze(1))
 
                 if use_e8vq:
-                    # Hessian-aware E8P: H̃^{-1}[j,j]=d 작을수록 중요한 column
-                    # scale * sqrt(d) → d 작으면 scale 작아져서 resolution 높아짐
-                    scale_e8_col = (scale_e8_layer * d.sqrt().clamp(min=1e-8)
-                                    ).expand(self.d_row // 8, 1)
+                    scale_e8_col = scale_e8_layer.expand(self.d_row // 8, 1)
                     if getattr(self, 'export_mode', False):
                         q_rot, _idx = quantize_e8_indexed(col_rot, scale_e8_col.to(col_rot.dtype))
                         idx_col_list.append(_idx.cpu())
